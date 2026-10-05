@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach, beforeEach, vi } from "vitest";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -7,6 +7,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { entryPath, setActiveConfig } from "../src/command.js";
+import { chooseWorkspace, recordTrust, removeTrust, trustKey } from "../src/config.js";
 import { createServer, ServerOptions, UNTRUSTED_NOTICE } from "../src/server.js";
 import { SlackSession } from "../src/session.js";
 import { installSlackStub, makeUser, paginate, restoreAll, writeTempConfig, TempConfig } from "./helpers/slackStub.js";
@@ -36,6 +37,20 @@ function tempConfig(...args: Parameters<typeof writeTempConfig>): TempConfig {
   const cfg = writeTempConfig(...args);
   cleanups.push(() => cfg.cleanup());
   return cfg;
+}
+
+/** A project dir with a real .slacker.json (and a fresh trust store), as `slacker serve` would find it. */
+function projectDir(settings: Record<string, unknown>, mode = 0o644) {
+  const dir = mkdtempSync(join(tmpdir(), "slacker-srv-proj-"));
+  cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+  const file = join(dir, ".slacker.json");
+  const write = (next: Record<string, unknown>) => {
+    writeFileSync(file, JSON.stringify(next));
+    chmodSync(file, mode);
+  };
+  write(settings);
+  process.env.SLACKER_TRUST_FILE = join(dir, "trust.json");
+  return { dir, file, write, trust: (ws: string) => recordTrust(trustKey(file), ws), untrust: () => removeTrust(trustKey(file)) };
 }
 
 async function connect(opts: ServerOptions) {
@@ -304,10 +319,11 @@ describe("tools", () => {
   it("whoami reports source, projectFile, readOnly and an alias warning", async () => {
     installSlackStub();
     const cfg = tempConfig({ work: {}, copy: {} });
-    const choice = { name: "work", source: "project" as const, projectFile: "/p/.slacker.json", readOnly: true };
-    const { client } = await connect({ workspace: "work", configFile: cfg.file, choice });
+    const p = projectDir({ workspace: "work", readOnly: true });
+    const choice = chooseWorkspace(undefined, p.dir);
+    const { client } = await connect({ workspace: "work", configFile: cfg.file, choice, cwd: p.dir });
     const me = json(await call(client, "whoami"));
-    expect(me).toMatchObject({ workspace: "work", team: "Work", source: "project", projectFile: "/p/.slacker.json", readOnly: true });
+    expect(me).toMatchObject({ workspace: "work", team: "Work", source: "project", projectFile: p.file, readOnly: true });
     expect(me.aliases).toEqual(["copy"]);
     expect(me.warning).toMatch(/shares its Slack team with "copy" in config.json \(both sign in to "Work" \(T0WORK001\)\)/);
   });
@@ -461,4 +477,115 @@ describe.skipIf(!existsSync(DIST_ENTRY))("stdio smoke (built dist)", () => {
     expect(text(r)).toContain("`slacker auth list`");
     expect(text(r)).toContain(`-c "${cfg.file}")`); // startServer called setActiveConfig: the run note names it
   }, 15_000);
+});
+
+describe("workspace chosen by an untrusted .slacker.json (serve without --workspace)", () => {
+  const WRITES = [
+    ["send_message", { target: CHANNEL, text: "hi" }],
+    ["send_message", { target: CHANNEL, text: "hi", dry_run: true }],
+    ["edit_message", { target: LINK, text: "x" }],
+    ["delete_message", { target: LINK }],
+    ["add_reaction", { target: LINK, emoji: "eyes" }],
+    ["set_status", { text: "away" }],
+  ] as const;
+
+  /** `slacker serve` started in `dir` without --workspace (or with `flag`). */
+  async function serveIn(dir: string, cfgFile: string, flag?: string) {
+    const choice = chooseWorkspace(flag, dir);
+    return connect({ workspace: choice.name, configFile: cfgFile, choice, cwd: dir });
+  }
+
+  it("every write tool refuses with untrusted_project before any Slack call (MCP wording, no -w); reads work; whoami reports it", async () => {
+    const slack = installSlackStub().on("conversations.history", { messages: [] });
+    const cfg = tempConfig();
+    const p = projectDir({ workspace: "work" });
+    const { client } = await serveIn(p.dir, cfg.file);
+    expect(await toolNames(client)).toEqual([...READ_TOOLS, ...WRITE_TOOLS].sort());
+    for (const [name, args] of WRITES) {
+      const r = await call(client, name, args);
+      expect(r.isError, name).toBe(true);
+      expect(text(r).split("\n")[0]).toBe( // then the "(run slacker as: …)" note
+        `Refusing to write: ${p.file} picks workspace "work", but it isn't trusted on this machine. ` +
+          `Ask the user to check it and run \`slacker trust\` in ${p.dir}. This server rechecks trust on every write, so no reconnect is needed.`
+      );
+      expect(text(r)).not.toMatch(/-w\b/);
+    }
+    expect(slack.count()).toBe(0);
+    expect((await call(client, "read_messages", { target: CHANNEL })).isError).toBeFalsy();
+    const me = json(await call(client, "whoami"));
+    expect(me).toMatchObject({ source: "project", projectFile: p.file, projectTrusted: false });
+    expect(me.warning).toContain("slacker trust");
+    expect(client.getInstructions()).toContain(`When the server started, every write tool refused: Refusing to write: ${p.file} picks workspace "work"`);
+    expect(client.getInstructions()).toContain("Writes recheck this on every call");
+  });
+
+  it("D3: slacker trust and trust --remove take effect on the next write, without reconnecting", async () => {
+    const slack = installSlackStub();
+    const cfg = tempConfig();
+    const p = projectDir({ workspace: "work" });
+    const { client } = await serveIn(p.dir, cfg.file);
+    const send = () => call(client, "send_message", { target: CHANNEL, text: "hi" });
+    expect((await send()).isError).toBe(true);
+    p.trust("work"); // the user runs `slacker trust`
+    expect((await send()).isError).toBeFalsy();
+    expect(json(await call(client, "whoami"))).toMatchObject({ projectTrusted: true });
+    expect(json(await call(client, "whoami"))).not.toHaveProperty("warning");
+    p.untrust(); // `slacker trust --remove`
+    expect(text(await send())).toContain("isn't trusted on this machine");
+    expect(json(await call(client, "whoami"))).toMatchObject({ projectTrusted: false, warning: expect.stringContaining("isn't trusted") });
+    expect(slack.count("chat.postMessage")).toBe(1);
+  });
+
+  it("refuses when the file changed after startup: another workspace (project_changed), or now read-only", async () => {
+    const slack = installSlackStub();
+    const cfg = tempConfig({ work: {}, side: { teamId: "T0SIDE001" } });
+    const p = projectDir({ workspace: "work" });
+    p.trust("work");
+    const { client } = await serveIn(p.dir, cfg.file);
+    const react = () => call(client, "add_reaction", { target: LINK, emoji: "eyes" });
+    expect((await react()).isError).toBeFalsy();
+    p.write({ workspace: "side" });
+    expect(text(await react())).toContain(`picks workspace "side", but it isn't trusted`);
+    p.trust("side"); // trusted for "side" now, but this server writes to "work"
+    const changed = text(await react());
+    expect(changed).toContain(`Refusing to write: this server started with workspace "work" (from .slacker.json at ${p.file}), but ${p.file} now picks "side".`);
+    expect(changed).toContain("restart the MCP server");
+    p.write({ workspace: "work", readOnly: true });
+    p.trust("work");
+    expect(text(await react())).toBe(`Refusing to write: this project is now read-only ("readOnly": true in ${p.file}).`);
+    rmSync(p.file); // the file that picked "work" is gone: don't keep writing to its choice
+    expect(text(await react())).toContain("no .slacker.json picks it any more");
+    expect(slack.count("reactions.add")).toBe(1);
+  });
+
+  it("a trusted project file, or an explicit --workspace, writes normally", async () => {
+    const cfg = tempConfig();
+    const p = projectDir({ workspace: "work" });
+    for (const [label, flag] of [["flag", "work"], ["trusted", undefined]] as const) {
+      if (label === "trusted") p.trust("work");
+      const slack = installSlackStub();
+      const { client } = await serveIn(p.dir, cfg.file, flag);
+      const r = await call(client, "send_message", { target: CHANNEL, text: "hi", dry_run: true });
+      expect(r.isError, `${label}: ${text(r)}`).toBeFalsy();
+      expect(json(await call(client, "whoami"))).not.toHaveProperty("warning");
+      expect(slack.count("auth.test")).toBeGreaterThan(0);
+    }
+  });
+
+  it("a .slacker.json someone else could change blocks writes even with --workspace (MCP wording)", async () => {
+    const slack = installSlackStub();
+    const cfg = tempConfig();
+    const p = projectDir({ workspace: "work" }, 0o646);
+    const { client } = await serveIn(p.dir, cfg.file, "work");
+    const r = await call(client, "set_status", { text: "away" });
+    expect(r.isError).toBe(true);
+    expect(text(r)).toBe(
+      `Refusing to write: ${p.file} is writable by others (mode 646), so slacker doesn't trust it — and it might say "readOnly": true. ` +
+        `Ask the user to fix it (chmod go-w ${p.file}) or remove it. This server rechecks it on every write, so no reconnect is needed.`
+    );
+    expect(json(await call(client, "whoami"))).toMatchObject({ ignoredProjectFile: p.file });
+    chmodSync(p.file, 0o644); // fixed while the server runs
+    expect((await call(client, "set_status", { text: "away" })).isError).toBeFalsy();
+    expect(slack.count("users.profile.set")).toBe(1);
+  });
 });

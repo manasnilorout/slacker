@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach, beforeEach, vi } from "vitest";
-import { chmodSync, existsSync, lstatSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
@@ -399,6 +399,15 @@ describe("read output (P2-18, P2-19)", () => {
       .on("conversations.info", { channel: GENERAL });
     const r = await run(["unread"]);
     expect(r.stdout).toMatch(/#general\s+channel\s+2 @/);
+  });
+
+  it("unread labels a private channel \"private\" (A-P2-9)", async () => {
+    const SECRET = { id: "C0SECRET01", name: "secret", is_private: true };
+    slack()
+      .on("client.counts", { channels: [{ id: SECRET.id, has_unreads: true, mention_count: 1, latest: "1700000000.000100" }] })
+      .on("conversations.info", { channel: SECRET });
+    expect((await run(["unread"])).stdout).toMatch(/#secret\s+private\s+1 @/);
+    expect(JSON.parse((await run(["--json", "unread"])).stdout).conversations[0].type).toBe("private_channel");
   });
 
   it("thread and channels print cursor hints", async () => {
@@ -1115,5 +1124,335 @@ describe("init --mcp-only with an invalid .slacker.json (F9)", () => {
     expect(r.overridden).toEqual([]);
     expect(r.warnings.join(" ")).toMatch(/left untouched \(--mcp-only\).*starts degraded/);
     expect(readJson(join(cwd, ".mcp.json")).mcpServers.slacker.args).toEqual(["serve", "--workspace", "work", "--config", cfg.file]);
+  });
+});
+
+// ── Security review: untrusted .slacker.json, terminal escapes ──
+
+describe("untrusted .slacker.json (trust model)", () => {
+  const projectFile = () => join(cwd, ".slacker.json");
+  /** A .slacker.json as a cloned repo would have it: not written by init, so not trusted. */
+  const cloned = (settings: Record<string, unknown>) => writeFileSync(projectFile(), JSON.stringify(settings), { mode: 0o644 });
+  const allWrites = [
+    ["send", "general", "hi"],
+    ["send", "general", "hi", "--dry-run"],
+    ["edit", LINK, "new"],
+    ["delete", LINK, "--yes"],
+    ["react", LINK, "eyes"],
+    ["status", "--set", "lunch"],
+    ["status", "--clear"],
+  ];
+
+  beforeEach(() => {
+    const dir = mkdtempSync(join(tmpdir(), "slacker-cli-trust-"));
+    cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+    process.env.SLACKER_TRUST_FILE = join(dir, "trusted-projects.json");
+  });
+
+  it("refuses every write (dry runs too) that would use its workspace, before any Slack call", async () => {
+    const s = slack();
+    cloned({ workspace: "side" });
+    for (const args of allWrites) {
+      const r = await run(args);
+      expect(r.code, args.join(" ")).toBe(1);
+      expect(r.stderr).toContain(
+        `slacker: Refusing to write: ${projectFile()} picks workspace "side", but it isn't trusted on this machine. ` +
+          `If that workspace is right, run \`slacker trust\` in ${cwd} (once). To use a different workspace for one command, pass -w <name>.`
+      );
+    }
+    expect(s.count()).toBe(0);
+    const j = JSON.parse((await run(["--json", "send", "general", "hi"])).stdout);
+    expect(j.error).toMatchObject({ code: "untrusted_project", hint: expect.stringContaining(`check that "side" is right, then run slacker trust in ${cwd}`) });
+  });
+
+  it("-w and SLACKER_WORKSPACE bypass its workspace choice", async () => {
+    const s = slack();
+    cloned({ workspace: "side" });
+    expect((await run(["send", "general", "hi", "-w", "work"])).code).toBe(0);
+    process.env.SLACKER_WORKSPACE = "work";
+    expect((await run(["send", "general", "hi"])).code).toBe(0);
+    expect(s.callsTo("chat.postMessage").map((c) => c.headers.authorization)).toEqual(["Bearer xoxc-test-token", "Bearer xoxc-test-token"]);
+  });
+
+  it("its readOnly is honoured whether or not it's trusted, even with -w", async () => {
+    const s = slack();
+    cloned({ workspace: "side", readOnly: true });
+    for (const extra of [[], ["-w", "work"]]) {
+      const r = await run(["send", "general", "hi", ...extra]);
+      expect(r.code).toBe(1);
+      expect(r.stderr).toContain("read-only");
+    }
+    expect(writes(s)).toEqual([]);
+  });
+
+  it("reads use its workspace with a one-line warning", async () => {
+    const s = slack().on("conversations.history", { messages: [] });
+    cloned({ workspace: "side" });
+    const r = await run(["read", "general"]);
+    expect(r.code).toBe(0);
+    expect(s.callsTo("conversations.history")[0].headers.authorization).toBe("Bearer xoxc-side-token");
+    expect(r.stderr.trim()).toBe(`Warning: Using workspace "side" from untrusted ${projectFile()}; run slacker trust to silence`);
+  });
+
+  it("slacker trust allows it as it is now; editing the workspace needs trusting again; --remove undoes it", async () => {
+    const s = slack().on("conversations.history", { messages: [] });
+    cloned({ workspace: "side" });
+    const t = await run(["trust"]);
+    expect(t.code).toBe(0);
+    expect(t.stdout).toContain(`✓ Trusted ${projectFile()} → workspace "side"`);
+    expect((await run(["send", "general", "hi"])).code).toBe(0);
+    expect(s.callsTo("chat.postMessage")[0].headers.authorization).toBe("Bearer xoxc-side-token");
+    expect((await run(["read", "general"])).stderr).toBe("");
+    expect((await run(["trust"])).stdout).toContain("is already trusted");
+
+    cloned({ workspace: "work" }); // someone changed the pinned workspace
+    const changed = await run(["send", "general", "hi"]);
+    expect(changed.code).toBe(1);
+    expect(changed.stderr).toContain('(you trusted it for workspace "side", but it now says "work")');
+    expect(JSON.parse((await run(["--json", "trust"])).stdout)).toMatchObject({ action: "trusted", workspace: "work", previous: "side" });
+
+    const list = JSON.parse((await run(["--json", "trust", "--list"])).stdout);
+    expect(list.list.projects).toEqual([expect.objectContaining({ file: realpathSync(projectFile()), workspace: "work", status: "ok" })]);
+    expect((await run(["trust", "--remove"])).stdout).toContain(`✓ No longer trusting ${projectFile()}`);
+    expect((await run(["send", "general", "hi"])).code).toBe(1);
+    expect((await run(["trust", "--remove"])).stdout).toContain("wasn't trusted");
+    expect(s.count("chat.postMessage")).toBe(1);
+  });
+
+  it("trust refuses when there's nothing sensible to trust", async () => {
+    expect(JSON.parse((await run(["--json", "trust"])).stdout).error.code).toBe("no_project_file");
+    cloned({ readOnly: true });
+    expect((await run(["trust"])).stderr).toMatch(/doesn't choose a workspace, so there is nothing to trust/);
+    cloned({ workspace: "nope" });
+    expect((await run(["trust"])).stderr).toContain(`Workspace "nope" (from .slacker.json at ${projectFile()}) not found`);
+    expect(existsSync(process.env.SLACKER_TRUST_FILE!)).toBe(false);
+    expect((await run(["trust", "--list", "--remove"])).stderr).toMatch(/not both/);
+  });
+
+  it("init trusts the file it writes, so writes work right away", async () => {
+    const s = slack();
+    expect((await run(["init", "side"])).stdout).toContain("trusted on this machine");
+    expect((await run(["send", "general", "hi"])).code).toBe(0);
+    expect(s.callsTo("chat.postMessage")[0].headers.authorization).toBe("Bearer xoxc-side-token");
+  });
+
+  it("whoami reports trust (human and --json projectTrusted)", async () => {
+    slack();
+    expect(JSON.parse((await run(["--json", "whoami"])).stdout).projectTrusted).toBeNull();
+    cloned({ workspace: "side" });
+    const human = await run(["whoami"]);
+    expect(human.stdout).toContain(".slacker.json is not trusted on this machine: writes are refused until you run slacker trust (or pass -w)");
+    expect(JSON.parse((await run(["--json", "whoami"])).stdout)).toMatchObject({ source: "project", projectTrusted: false });
+    await run(["trust"]);
+    expect((await run(["whoami"])).stdout).toContain(".slacker.json is trusted on this machine");
+    expect(JSON.parse((await run(["--json", "whoami"])).stdout).projectTrusted).toBe(true);
+  });
+
+  it("a corrupt trust file refuses writes (naming it) and only warns for reads", async () => {
+    slack().on("conversations.history", { messages: [] });
+    cloned({ workspace: "side" });
+    writeFileSync(process.env.SLACKER_TRUST_FILE!, "{oops");
+    const w = await run(["send", "general", "hi"]);
+    expect(w.code).toBe(1);
+    expect(w.stderr).toContain(`the trust record couldn't be read: Invalid trust file ${process.env.SLACKER_TRUST_FILE}`);
+    expect((await run(["read", "general"])).code).toBe(0);
+  });
+
+  it("serve without --workspace passes the untrusted choice on (write tools refuse there)", async () => {
+    cloned({ workspace: "side" });
+    await run(["serve"]);
+    expect(startServer).toHaveBeenCalledWith(expect.objectContaining({ choice: expect.objectContaining({ name: "side", source: "project", projectTrusted: false }) }));
+  });
+
+  describe("a .slacker.json someone else could have written (ownership/permissions)", () => {
+    it.each([0o646, 0o666, 0o662])("mode %s (writable by others): reads ignore it with a warning; writes refuse even with -w", async (mode) => {
+      const s = slack().on("conversations.history", { messages: [] });
+      cloned({ workspace: "side" });
+      chmodSync(projectFile(), mode);
+      const r = await run(["read", "general"]);
+      expect(r.code).toBe(0);
+      expect(s.callsTo("conversations.history")[0].headers.authorization).toBe("Bearer xoxc-test-token"); // defaultWorkspace, not "side"
+      expect(r.stderr).toContain(`Warning: Ignoring ${projectFile()}: it is writable by`);
+      for (const extra of [[], ["-w", "work"]]) {
+        const w = await run(["--json", "send", "general", "hi", ...extra]);
+        expect(JSON.parse(w.stdout).error).toMatchObject({ code: "untrusted_project", message: expect.stringContaining(`${projectFile()} is writable by`) });
+      }
+      expect(JSON.parse((await run(["--json", "trust"])).stdout).error.code).toBe("untrusted_project");
+      expect(writes(s)).toEqual([]);
+      chmodSync(projectFile(), 0o644);
+      expect((await run(["send", "general", "hi", "-w", "work"])).code).toBe(0);
+    });
+
+    it("D6: your own file that only its group can write is ignored without -w, but with -w it only adds readOnly and a warning", async () => {
+      const s = slack().on("conversations.history", { messages: [] });
+      cloned({ workspace: "side" });
+      chmodSync(projectFile(), 0o664);
+      const warning = `Warning: ${projectFile()} is writable by its group (mode 664), so only its "readOnly" is used (-w picks the workspace); without -w it's ignored and writes are refused. Fix: chmod g-w ${projectFile()}`;
+      // Without -w: ignored (reads use the default workspace), writes refused.
+      expect((await run(["read", "general"])).stderr).toContain(`Warning: Ignoring ${projectFile()}: it is writable by its group (mode 664)`);
+      expect(JSON.parse((await run(["--json", "send", "general", "hi"])).stdout).error.code).toBe("untrusted_project");
+      // With -w: the write goes through, with a warning.
+      const w = await run(["send", "general", "hi", "-w", "work"]);
+      expect(w.code).toBe(0);
+      expect(w.stderr.trim()).toBe(warning);
+      expect((await run(["read", "general", "-w", "work"])).stderr.trim()).toBe(warning);
+      process.env.SLACKER_WORKSPACE = "work";
+      expect((await run(["send", "general", "hi"])).stderr).toContain("(SLACKER_WORKSPACE picks the workspace)");
+      delete process.env.SLACKER_WORKSPACE;
+      expect(s.count("chat.postMessage")).toBe(2);
+      // Its "readOnly" still applies (fail closed).
+      cloned({ workspace: "side", readOnly: true });
+      chmodSync(projectFile(), 0o664);
+      const ro = JSON.parse((await run(["--json", "send", "general", "hi", "-w", "work"])).stdout);
+      expect(ro.error).toMatchObject({ code: "read_only" });
+      expect(s.count("chat.postMessage")).toBe(2);
+      // trust --list says why instead of "not yours" (B-P2-3).
+      chmodSync(projectFile(), 0o644);
+      expect((await run(["trust"])).code).toBe(0);
+      chmodSync(projectFile(), 0o664);
+      expect((await run(["trust", "--list"])).stdout).toContain("not trusted: is writable by its group (mode 664)");
+      expect(JSON.parse((await run(["--json", "trust", "--list"])).stdout).list.projects[0]).toMatchObject({ status: "foreign", reason: "is writable by its group (mode 664)" });
+    });
+
+    it("B-P2-4: a .slacker.json in a directory others can write to (no sticky bit) is foreign; with the sticky bit it's fine", async () => {
+      const s = slack();
+      const shared = join(cwd, "shared");
+      mkdirSync(shared);
+      writeFileSync(join(shared, ".slacker.json"), JSON.stringify({ workspace: "work" }));
+      chmodSync(shared, 0o777);
+      const r = JSON.parse((await run(["--json", "send", "general", "hi", "-w", "work"], { cwd: shared })).stdout);
+      expect(r.error).toMatchObject({ code: "untrusted_project", message: expect.stringContaining(`is in ${shared}, which other users can write to (mode 777, no sticky bit)`) });
+      expect(r.error.message).toContain(`chmod o-w ${shared}, or move the project`);
+      chmodSync(shared, 0o1777);
+      expect((await run(["send", "general", "hi", "-w", "work"], { cwd: shared })).code).toBe(0);
+      chmodSync(shared, 0o755);
+      expect(s.count("chat.postMessage")).toBe(1);
+    });
+  });
+
+  it("B-P2-7: a trust file someone else could write is ignored: nothing is trusted, with a clear error", async () => {
+    const s = slack();
+    cloned({ workspace: "side" });
+    expect((await run(["trust"])).code).toBe(0);
+    expect((await run(["send", "general", "hi"])).code).toBe(0);
+    const trustFile = process.env.SLACKER_TRUST_FILE!;
+    chmodSync(trustFile, 0o666);
+    const w = await run(["send", "general", "hi"]);
+    expect(w.code).toBe(1);
+    expect(w.stderr).toContain(
+      `the trust record couldn't be read: Ignoring the trust file ${trustFile}: it is writable by group and others (mode 666), so someone else could have added trust records. ` +
+        `Until it's fixed, no .slacker.json counts as trusted. Fix it (chmod go-w ${trustFile}), or delete it and run slacker trust again in your projects.`
+    );
+    for (const args of [["trust"], ["trust", "--list"]]) {
+      expect(JSON.parse((await run(["--json", ...args])).stdout).error.code, args.join(" ")).toBe("invalid_trust_file");
+    }
+    chmodSync(trustFile, 0o600);
+    expect((await run(["send", "general", "hi"])).code).toBe(0);
+    expect(s.count("chat.postMessage")).toBe(2);
+  });
+
+  it("B-P2-5: trust --remove <file> matches however the path is cased (case-insensitive file systems)", async () => {
+    cloned({ workspace: "side" });
+    expect((await run(["trust"])).code).toBe(0);
+    const upper = join(cwd.toUpperCase(), ".slacker.json");
+    if (!existsSync(upper)) return; // case-sensitive file system: nothing to check
+    const r = JSON.parse((await run(["--json", "trust", "--remove", upper])).stdout);
+    expect(r).toMatchObject({ action: "removed", workspace: "side", realFile: realpathSync.native(projectFile()) });
+  });
+});
+
+describe("terminal escape sequences from Slack are neutralised in human output", () => {
+  const ESC = "\x1b";
+  const OSC52 = `${ESC}]52;c;Y3VybCBldmlsLnNoIHwgc2g=\x07`;
+  const CLEAR = `${ESC}[2J`;
+  const HOSTILE = `deploy ${OSC52}done${CLEAR}\r ok`;
+  const CONTROL = /[\x00-\x08\x0b-\x1f\x7f-\x9f]/;
+
+  function hostileSlack() {
+    return slack()
+      .on("conversations.history", { messages: [{ ts: "1700000000.123456", user: "U0EVIL0001", text: HOSTILE, files: [{ name: `f${CLEAR}.txt` }] }] })
+      .on("users.info", { user: { id: "U0EVIL0001", name: `eve${ESC}]0;title${ESC}\\`, profile: { display_name: `eve${ESC}]0;title${ESC}\\` } } });
+  }
+
+  it("read prints message text, names and file names without escapes; --json round-trips them escaped", async () => {
+    hostileSlack();
+    const human = await run(["read", "general"]);
+    expect(human.code).toBe(0);
+    expect(human.stdout).not.toContain(ESC);
+    expect(human.stdout).not.toMatch(CONTROL);
+    expect(human.stdout).toContain("deploy done ok");
+    expect(human.stdout).toContain("eve");
+    expect(human.stdout).toContain("f.txt");
+
+    const json = await run(["--json", "read", "general"]);
+    expect(json.stdout).not.toContain(ESC);
+    expect(json.stdout).toContain("\\u001b]52;c;");
+    expect(JSON.parse(json.stdout).messages[0].text).toBe(HOSTILE);
+  });
+
+  it("channel names/topics, team names and the delete prompt are sanitized", async () => {
+    const evil = { id: "C0GENERAL1", name: `general${CLEAR}`, topic: { value: `topic${OSC52}` }, num_members: 3 };
+    slack()
+      .on("users.conversations", (p) => paginate([evil], "channels", p))
+      .on("conversations.info", { channel: { ...evil, name: "general" } })
+      .on("auth.test", { ...DEFAULT_IDENTITY, team: `Work${ESC}]0;x\x07` });
+    const channels = await run(["channels"]);
+    expect(channels.stdout).toContain("#general");
+    expect(channels.stdout).not.toContain(ESC);
+    const who = await run(["whoami"]);
+    expect(who.stdout).toContain("Work");
+    expect(who.stdout).not.toContain(ESC);
+    const del = await run(["delete", LINK], { stdin: fakeStdin("n\n", true) });
+    expect(del.stderr).toContain('team "Work" (workspace "work")? [y/N]');
+    expect(del.stderr).not.toContain(ESC);
+  });
+
+  it("errors printed to stderr are sanitized (messages can quote Slack or file content)", async () => {
+    slack();
+    const r = await run(["read", `#nosuch${CLEAR}`]);
+    expect(r.code).toBe(1);
+    expect(r.stderr).toContain("slacker: ");
+    expect(r.stderr).not.toContain(ESC);
+    // JSON.parse quotes the file's contents in its error: `Unexpected token 'o', "oops␛]52…" is not valid JSON`.
+    writeFileSync(join(cwd, ".slacker.json"), `oops${OSC52}${CLEAR}`);
+    const bad = await run(["read", "general", "-w", "work"]);
+    expect(bad.stderr).toContain('Warning: Could not parse');
+    expect(bad.stderr).toContain('"oops52;c'); // the quoted snippet, made inert
+    expect(bad.stderr).not.toContain(ESC);
+    const failed = await run(["send", "general", "hi"]); // writes refuse an invalid file: the error printer sanitizes too
+    expect(failed.stderr).toContain("slacker: Could not parse");
+    expect(failed.stderr).not.toContain(ESC);
+  });
+
+  it("D4: --json results and errors \\u-escape DEL, C1 and bidi controls, and still parse back exactly", async () => {
+    const TRICKY = "a\x9b2Jb\u202eevil\x7fc\u2066d";
+    slack()
+      .on("conversations.history", { messages: [{ ts: "1700000000.123456", user: "U0EVIL0001", text: TRICKY }] })
+      .on("users.info", { user: { id: "U0EVIL0001", name: "eve" } });
+    const BAD = /[\x7f-\x9f\u202a-\u202e\u2066-\u2069]/;
+    const r = await run(["--json", "read", "general"]);
+    expect(r.stdout).not.toMatch(BAD);
+    expect(r.stdout).toContain("\\u009b2Jb\\u202eevil\\u007fc\\u2066d");
+    expect(JSON.parse(r.stdout).messages[0].text).toBe(TRICKY);
+    const err = await run(["--json", "read", `#no\u202esuch`]);
+    expect(err.code).toBe(1);
+    expect(err.stdout).not.toMatch(BAD);
+    expect(JSON.parse(err.stdout).error.message).toContain("#no\u202esuch");
+  });
+
+  it("D7: a dry run shows your own text faithfully, with controls made visible (Slack text is still stripped)", async () => {
+    slack();
+    const r = await run(["send", "general", "--dry-run", `ok\rEVIL ${ESC}[2J\u202eabc\tend\nline2`]);
+    expect(r.code).toBe(0);
+    expect(r.stdout).toContain("  ok\\rEVIL \\x1b[2J\\u202eabc\tend\n  line2");
+    expect(r.stdout).not.toContain(ESC);
+    expect(r.stdout).not.toMatch(/[\r\u202e]/);
+    expect(JSON.parse((await run(["--json", "send", "general", "--dry-run", "a\rb"])).stdout).text).toBe("a\rb");
+  });
+
+  it("our own colours still work on sanitized text", async () => {
+    const { sanitizeForTerminal, sanitizeDeep } = await import("../src/output.js");
+    expect(sanitizeDeep({ a: [`x${CLEAR}`] })).toEqual({ a: ["x"] });
+    expect(`\x1b[1m${sanitizeForTerminal(`bold${CLEAR}`)}\x1b[0m`).toBe("\x1b[1mbold\x1b[0m");
   });
 });

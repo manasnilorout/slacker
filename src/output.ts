@@ -1,6 +1,66 @@
 import { runNote, stripRunNote } from "./command.js";
 import type { FormattedMessage } from "./format.js";
 
+/**
+ * Terminal escape sequences: CSI (`ESC [ … final`, or the 8-bit `0x9B`), string sequences (OSC `ESC ]`,
+ * DCS `ESC P`, SOS `ESC X`, PM `ESC ^`, APC `ESC _`, or their 8-bit forms) up to their terminator (BEL,
+ * `ESC \` or `0x9C`), and two/three-byte escapes (`ESC c`, `ESC ( B` …). An unterminated string sequence
+ * only loses its introducer (`ESC ]` …), which leaves the rest as harmless text.
+ */
+const ESCAPE_SEQUENCE =
+  /\x1b\[[0-?]*[ -/]*[@-~]|\x9b[0-?]*[ -/]*[@-~]|(?:\x1b[\]PX^_]|[\x90\x98\x9d\x9e\x9f])[^\x07\x1b\x9c]*(?:\x07|\x1b\\|\x9c)|\x1b[ -/]*[0-~]/g;
+/** C0 controls except \t and \n, DEL, C1 controls, and the bidi embedding/override/isolate characters. */
+const CONTROL_CHARS = /[\x00-\x08\x0b-\x1f\x7f-\x9f‪-‮⁦-⁩]/g;
+
+/**
+ * Make text from Slack (or any file slacker didn't write) safe to print to a terminal: removes escape
+ * sequences (cursor movement, screen clearing, window titles, OSC 52 clipboard writes, hyperlinks …)
+ * and every control character except newline and tab, including \r and bidi overrides. Colour codes
+ * slacker adds itself are applied after this, so they survive.
+ */
+export function sanitizeForTerminal(s: string): string {
+  return s.replace(ESCAPE_SEQUENCE, "").replace(CONTROL_CHARS, "");
+}
+
+/** Control characters `showControls` makes visible: the same set `sanitizeForTerminal` strips. */
+const SHOWN_CONTROLS = /[\x00-\x08\x0b-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]/g;
+
+/**
+ * Text the user wrote, made safe for the terminal *and* faithful: every control character
+ * `sanitizeForTerminal` would delete is shown as an escape instead (`\r`, `\x1b`, `\u202e` …), so a
+ * dry-run preview shows exactly what would be sent. Newlines and tabs are kept as they are.
+ */
+export function showControls(s: string): string {
+  return s.replace(SHOWN_CONTROLS, (c) => {
+    if (c === "\r") return "\\r";
+    const code = c.charCodeAt(0);
+    return code < 0x100 ? `\\x${code.toString(16).padStart(2, "0")}` : `\\u${code.toString(16).padStart(4, "0")}`;
+  });
+}
+
+/**
+ * `--json` text that is safe to print to a terminal: JSON.stringify escapes only U+0000–U+001F, so
+ * DEL, the C1 controls (U+0080–U+009F, e.g. the 8-bit CSI U+009B) and the bidi embedding, override
+ * and isolate characters (U+202A–U+202E, U+2066–U+2069) are written as `\uXXXX` escapes too. These
+ * can only occur inside JSON strings, so the result is still valid JSON and parses back to exactly
+ * the same value. LRM/RLM (U+200E/U+200F) are left as they are.
+ */
+export function toSafeJson(data: unknown, indent: number | undefined = 2): string {
+  return JSON.stringify(data, null, indent).replace(/[\x7f-\x9f\u202a-\u202e\u2066-\u2069]/g, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`);
+}
+
+/** A copy of `value` with every string in it (keys too) passed through `sanitizeForTerminal`. */
+export function sanitizeDeep<T>(value: T): T {
+  if (typeof value === "string") return sanitizeForTerminal(value) as T;
+  if (Array.isArray(value)) return value.map(sanitizeDeep) as T;
+  if (typeof value === "object" && value !== null) {
+    const proto = Object.getPrototypeOf(value);
+    if (proto !== Object.prototype && proto !== null) return value; // not a plain result object
+    return Object.fromEntries(Object.entries(value).map(([k, v]) => [sanitizeForTerminal(k), sanitizeDeep(v)])) as T;
+  }
+  return value;
+}
+
 const useColor = !!process.stdout.isTTY && !process.env.NO_COLOR;
 const paint = (code: string) => (s: string) => (useColor ? `\x1b[${code}m${s}\x1b[0m` : s);
 
@@ -26,8 +86,9 @@ function indent(text: string, by = "  "): string {
     .join("\n");
 }
 
+/** `--json` output (results and errors): see `toSafeJson`. */
 export function printJson(data: unknown) {
-  console.log(JSON.stringify(data, null, 2));
+  console.log(toSafeJson(data));
 }
 
 export function printMessages(messages: readonly FormattedMessage[]) {
@@ -56,7 +117,7 @@ function printWithRunNote(lines: readonly string[], style: (s: string) => string
   for (const line of lines) {
     const bare = stripRunNote(line);
     noted ||= bare !== line;
-    console.log(style(bare));
+    console.log(style(sanitizeForTerminal(bare)));
   }
   if (noted && note) console.log(dim(note));
 }

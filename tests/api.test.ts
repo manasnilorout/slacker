@@ -277,7 +277,47 @@ describe("SlackAPI posting safety", () => {
     const e = await failure(api().client.call("chat.postMessage", { channel: "C1", text: "hi" }));
     expect(calls).toHaveLength(4);
     expect(e.message).not.toMatch(/may or may not/);
+    // A-P2-1: after the last retry it says so.
+    expect(e.message).toBe("Network error calling chat.postMessage: ECONNREFUSED — the message was NOT sent; try again later.");
   });
+
+  const refused = () => {
+    throw new TypeError("fetch failed", { cause: Object.assign(new Error("getaddrinfo"), { code: "EAI_AGAIN" }) });
+  };
+
+  it("D5: other writes that never reached Slack say the change was NOT made; reads add nothing", async () => {
+    stubFetch(refused);
+    for (const method of ["chat.update", "chat.delete", "reactions.add", "users.profile.set"]) {
+      const e = await failure(api({ maxRetries: 1 }).client.call(method));
+      expect(e.message, method).toBe(`Network error calling ${method}: EAI_AGAIN — the change was NOT made; try again later.`);
+    }
+    expect((await failure(api({ maxRetries: 1 }).client.call("conversations.history"))).message).toBe("Network error calling conversations.history: EAI_AGAIN");
+    expect((await failure(api({ maxRetries: 1 }).client.call("chat.getPermalink"))).message).toBe("Network error calling chat.getPermalink: EAI_AGAIN");
+  });
+
+  it("D5: a write retried after an ambiguous failure can't claim NOT made at the end", async () => {
+    let n = 0; // first attempt times out (it may have reached Slack), the retry can't connect
+    globalThis.fetch = ((u: string, init?: RequestInit) => (++n === 1 ? hang(u, init) : refused())) as typeof fetch;
+    const e = await failure(api({ timeoutMs: 20, maxRetries: 1 }).client.call("chat.update", { channel: "C1", ts: "1.2", text: "x" }));
+    expect(n).toBe(2);
+    expect(e.message).toBe("Network error calling chat.update: EAI_AGAIN — the change may or may not have been made; check before retrying.");
+  });
+
+  it.each(["fatal_error", "internal_error", "request_timeout", "service_unavailable"])(
+    "D5: Slack's %s on a post may or may not have posted it (an agent must not retry)",
+    async (code) => {
+      stubFetch(() => R(`{"ok":false,"error":"${code}"}`));
+      const e = await failure(api().client.call("chat.postMessage", { channel: "C1", text: "hi" }));
+      expect(e).toMatchObject({ code, hint: "Slack had an internal problem; the message may or may not have been posted; check the conversation before retrying." });
+      expect(e.message).toBe(
+        `Slack API error (chat.postMessage): ${code} — Slack had an internal problem; the message may or may not have been posted; check the conversation before retrying.`
+      );
+      const edit = await failure(api().client.call("chat.update", { channel: "C1", ts: "1.2", text: "x" }));
+      expect(edit.message).toBe(`Slack API error (chat.update): ${code} — Slack had an internal problem; the change may or may not have been made; check before retrying.`);
+      const read = await failure(api().client.call("conversations.history"));
+      expect(read.message).toBe(`Slack API error (conversations.history): ${code}`);
+    }
+  );
 
   it("treats message_not_found after an ambiguous chat.delete failure as deleted", async () => {
     const calls = stubFetch((n) => (n === 1 ? reset() : R('{"ok":false,"error":"message_not_found"}')));

@@ -3,7 +3,19 @@ import { createInterface } from "node:readline/promises";
 import { SlackApiError, SlackNetworkError } from "./api.js";
 import { authAdd, authDefault, authList, authRefresh, authRemove, authRename, authSetup } from "./auth.js";
 import { setActiveConfig, stripRunNote, withRunNote } from "./command.js";
-import { chooseWorkspace, configPath, parseBoolEnv, PROJECT_FILE, WorkspaceChoice } from "./config.js";
+import {
+  chooseWorkspace,
+  configPath,
+  listTrust,
+  parseBoolEnv,
+  PROJECT_FILE,
+  projectReadWarnings,
+  projectWriteWarnings,
+  recheckWriteBlock,
+  trustProject,
+  untrustProject,
+  WorkspaceChoice,
+} from "./config.js";
 import { SlackerError } from "./errors.js";
 import { initProject, InitOpts, printInit, STABLE_NODE_CANDIDATES } from "./init.js";
 import { IdentityProblem, identityProblems, LiveTeam } from "./messages.js";
@@ -23,6 +35,10 @@ import {
   printNotes,
   printTable,
   printWarnings,
+  sanitizeDeep,
+  sanitizeForTerminal,
+  showControls,
+  toSafeJson,
   yellow,
 } from "./output.js";
 import { errorMessage } from "./util.js";
@@ -90,16 +106,23 @@ class Context {
       this._choice = chooseWorkspace(this.opts.workspace, this.io.cwd, { ignoreInvalidProject: lenient });
       const ignored = this._choice.ignoredProjectError;
       if (ignored) {
-        console.error(
-          yellow(`Warning: ${withRunNote(`${stripRunNote(ignored)} Ignored for this command; write commands refuse to run until it's fixed.`)}`)
-        );
+        // The parse error can quote the file's contents: sanitize before it reaches the terminal.
+        const text = withRunNote(`${stripRunNote(ignored)} Ignored for this command; write commands refuse to run until it's fixed.`);
+        console.error(yellow(`Warning: ${sanitizeForTerminal(text)}`));
       }
+      // Writes refuse instead of using an untrusted file (recheckWriteBlock), so they only warn about a group-writable one (D6).
+      const warnings = this.isWrite ? projectWriteWarnings(this._choice) : projectReadWarnings(this._choice);
+      for (const w of warnings) console.error(yellow(`Warning: ${sanitizeForTerminal(w)}`));
     }
     return this._choice;
   }
 
   get session(): SlackSession {
-    return (this._session ??= new SlackSession(this.choice.name, this.file, { source: this.choice }));
+    return (this._session ??= new SlackSession(this.choice.name, this.file, {
+      source: this.choice,
+      // Re-read right before the write (D3): the project file may have changed since the command started.
+      writeCheck: () => recheckWriteBlock(this.choice, { cwd: this.io.cwd, flag: this.opts.workspace, surface: "cli" }),
+    }));
   }
 
   /** Writes are refused when the project's .slacker.json (or SLACKER_READ_ONLY) says read-only. */
@@ -142,7 +165,7 @@ async function messageText(ctx: Context, text: string, verb: "send" | "edit"): P
 async function confirm(io: CliIO, question: string): Promise<boolean> {
   const rl = createInterface({ input: io.stdin, output: process.stderr });
   try {
-    return /^y(es)?$/i.test((await rl.question(`${question} [y/N] `)).trim());
+    return /^y(es)?$/i.test((await rl.question(`${sanitizeForTerminal(question)} [y/N] `)).trim());
   } finally {
     rl.close();
   }
@@ -278,13 +301,18 @@ export function buildCli(ioOverrides: Partial<CliIO> = {}): Command {
     ...ioOverrides,
   };
 
-  /** Run a command: print JSON with --json, otherwise hand the result to the human printer. */
-  function run<A extends unknown[], T>(fn: (ctx: Context, ...args: A) => Promise<T> | T, human: (result: T, ctx: Context) => void) {
+  /**
+   * Run a command: print JSON with --json (toSafeJson escapes every control and bidi character),
+   * otherwise hand the result to the human printer with every string in it sanitized for the
+   * terminal — Slack-controlled text (messages, names, topics, file names …) can carry escape
+   * sequences. `raw` is the unsanitized result, for echoing the user's own text faithfully (D7).
+   */
+  function run<A extends unknown[], T>(fn: (ctx: Context, ...args: A) => Promise<T> | T, human: (result: T, ctx: Context, raw: T) => void) {
     return async (...args: unknown[]) => {
       const ctx = new Context(args[args.length - 1] as Command, io);
       const result = await fn(ctx, ...(args.slice(0, -1) as A));
       if (ctx.opts.json) printJson(result);
-      else human(result, ctx);
+      else human(sanitizeDeep(result), ctx, result);
     };
   }
 
@@ -295,7 +323,7 @@ export function buildCli(ioOverrides: Partial<CliIO> = {}): Command {
     .exitOverride()
     .configureOutput({
       writeErr: (s) => {
-        if (!io.jsonErrors) process.stderr.write(s);
+        if (!io.jsonErrors) process.stderr.write(sanitizeForTerminal(s));
       },
     })
     .configureHelp({ showGlobalOptions: true })
@@ -304,7 +332,10 @@ export function buildCli(ioOverrides: Partial<CliIO> = {}): Command {
     .hook("preAction", (_program, action) => setActiveConfig(configPath(action.optsWithGlobals<GlobalOpts>().config)))
     .option("-w, --workspace <name>", "workspace from config.json (default: SLACKER_WORKSPACE, .slacker.json, then defaultWorkspace)")
     .option("-c, --config <path>", "config file (default: SLACKER_CONFIG or ~/.config/slack-cli/config.json)")
-    .option("--json", "print JSON (errors too: {\"error\": {\"message\", \"code\", \"hint\"}})")
+    .option(
+      "--json",
+      "print JSON (errors too: {\"error\": {\"message\", \"code\", \"hint\"}}); DEL, C1 controls and bidi overrides/isolates are \\u-escaped"
+    )
     .addHelpText(
       "after",
       `
@@ -354,7 +385,7 @@ Examples:
       let opts: Parameters<typeof startServer>[0];
       try {
         const choice = chooseWorkspace(g.workspace, io.cwd);
-        opts = { workspace: choice.name, configFile, readOnly: !!o.readOnly || choice.readOnly, choice };
+        opts = { workspace: choice.name, configFile, readOnly: !!o.readOnly || choice.readOnly, choice, cwd: io.cwd };
       } catch (e) {
         // Corrupt .slacker.json: start degraded so the MCP client shows the reason (D10).
         opts = { configFile, readOnly: !!o.readOnly || parseBoolEnv(process.env.SLACKER_READ_ONLY), startupError: errorMessage(e) };
@@ -373,8 +404,17 @@ Examples:
       run(
         async (ctx) => {
           const me = await ctx.session.whoami();
-          const { source, projectFile, readOnly } = ctx.choice;
-          return { ...me, source, projectFile: projectFile ?? null, readOnly, ...identityWarning(ctx, me) };
+          const { source, projectFile, readOnly, projectTrusted, foreignProject } = ctx.choice;
+          return {
+            ...me,
+            source,
+            projectFile: projectFile ?? null,
+            // Whether projectFile may choose the workspace for writes (null: no project file naming one).
+            projectTrusted: projectTrusted ?? null,
+            ...(foreignProject && { ignoredProjectFile: foreignProject.file }),
+            readOnly,
+            ...identityWarning(ctx, me),
+          };
         },
         (me, ctx) => {
           console.log(`${bold(me.user)} in ${bold(me.team)} ${dim(`(${me.url}${me.enterpriseId ? ` · enterprise ${me.enterpriseId}` : ""})`)}`);
@@ -387,6 +427,15 @@ Examples:
                   ? "SLACKER_WORKSPACE"
                   : "defaultWorkspace in config.json";
           console.log(dim(`Workspace "${me.workspace}" chosen via ${via}${me.readOnly ? " · read-only" : ""}`));
+          if (me.projectTrusted !== null) {
+            console.log(
+              me.projectTrusted
+                ? dim(`${PROJECT_FILE} is trusted on this machine`)
+                : yellow(
+                    `${PROJECT_FILE} is not trusted on this machine${me.source === "project" ? ": writes are refused until you run slacker trust (or pass -w)" : ""}`
+                  )
+            );
+          }
           printWarnings(identityOf(ctx, me).map((p) => p.message));
         }
       )
@@ -606,11 +655,12 @@ Examples:
           });
           return r.dryRun ? { ...r, text } : r;
         },
-        (r) => {
+        (r, _ctx, raw) => {
           const label = r.destination.name + (r.threadTs ? ` (thread ${r.threadTs})` : "");
           if (r.dryRun) {
             console.log(destinationLine(label, r.team, r.workspace, yellow("Would send to")));
-            if ("text" in r) console.log(r.text.split("\n").map((l) => `  ${l}`).join("\n"));
+            // Your own text, exactly as it would be sent: controls shown as \r, \x1b, \u202e … (D7).
+            if ("text" in raw) console.log(showControls(raw.text).split("\n").map((l) => `  ${l}`).join("\n"));
             console.log(dim("Dry run — nothing was sent."));
             return;
           }
@@ -691,8 +741,11 @@ Examples:
   // ── Project setup ──────────────────────────────────────
   program
     .command("init")
-    .description(`pin this project to a workspace (writes ${PROJECT_FILE}; --mcp also registers the MCP server in .mcp.json)`)
-    .argument("[workspaces...]", "workspace name(s) from config.json (default: --workspace, SLACKER_WORKSPACE, existing .slacker.json, defaultWorkspace)")
+    .description(`pin this project to a workspace (writes ${PROJECT_FILE} and trusts it; --mcp also registers the MCP server in .mcp.json)`)
+    .argument(
+      "[workspaces...]",
+      "workspace name(s) from config.json (default: --workspace, SLACKER_WORKSPACE, the existing .slacker.json if you trust it, defaultWorkspace)"
+    )
     .option("--mcp", "also register the slacker MCP server in ./.mcp.json")
     .option("--mcp-only", `only write .mcp.json (leave ${PROJECT_FILE} alone)`)
     .option("--name <server>", 'server name in .mcp.json (single workspace; default "slacker", or slacker-<workspace> for several)')
@@ -709,6 +762,14 @@ Examples:
       "--command <cmd>",
       "with --mcp: command .mcp.json runs (default: the absolute path of slacker when it's on PATH, else node + this install's entry); entry path is kept unless <cmd> is slacker"
     )
+    .addHelpText(
+      "after",
+      `
+With no workspace named, init keeps the workspace of an existing ${PROJECT_FILE} only if you've
+trusted that file for it on this machine. A ${PROJECT_FILE} you haven't trusted (e.g. from a cloned
+repo) is refused, and nothing is written: check the workspace it names, then name it yourself:
+slacker init <workspace> [--mcp]. Naming the workspace writes ${PROJECT_FILE} and trusts it.`
+    )
     .action(
       run(
         (ctx, names: string[], o: InitOpts) =>
@@ -720,6 +781,62 @@ Examples:
             nodeCandidates: ctx.io.nodeCandidates,
           }),
         (r, ctx) => printInit(r, ctx.cmd.opts<InitOpts>(), ctx.file)
+      )
+    );
+
+  program
+    .command("trust")
+    .description(`let the nearest ${PROJECT_FILE} choose the workspace for writes on this machine (as it is now)`)
+    .option("--remove [file]", `stop trusting the nearest ${PROJECT_FILE} (or this one, even if it no longer exists)`)
+    .option("--list", "list trusted project files")
+    .addHelpText(
+      "after",
+      `
+A ${PROJECT_FILE} can always make a project read-only, but it only chooses the workspace for writes
+(send, edit, delete, react, status --set/--clear) once you trust it. slacker init <workspace> trusts
+the file it writes; after cloning a repo that has one, check the workspace it names and run slacker
+trust once. Editing the workspace in the file needs trusting again. -w / SLACKER_WORKSPACE skip the
+file's choice. Trust is checked again before every write, so a running MCP server picks up
+slacker trust and trust --remove without a reconnect.
+A ${PROJECT_FILE} or trust file someone else could change (owned by another user, writable by group
+or others, or in a directory others can write to without the sticky bit) is never trusted. One
+exception: your own ${PROJECT_FILE} that only its group can also write still applies its "readOnly"
+when -w / SLACKER_WORKSPACE picks the workspace (with a warning).
+Trust records: ~/.config/slacker/trusted-projects.json (SLACKER_TRUST_FILE overrides).`
+    )
+    .action(
+      run(
+        (ctx, o: { remove?: string | boolean; list?: boolean }) => {
+          if (o.list && o.remove !== undefined) throw new SlackerError("Use --list or --remove, not both.", "invalid_argument");
+          if (o.list) return { list: listTrust() };
+          if (o.remove !== undefined) return untrustProject(ctx.io.cwd, typeof o.remove === "string" ? o.remove : undefined);
+          return trustProject(ctx.io.cwd, ctx.file);
+        },
+        (r) => {
+          if ("list" in r) {
+            if (!r.list.projects.length) console.log(dim(`No trusted projects (${r.list.trustFile}).`));
+            const STATUS = { ok: "", changed: yellow("now names another workspace"), missing: dim("missing"), invalid: yellow("invalid"), foreign: yellow("not trusted") };
+            // foreign / invalid: say why ("not trusted: is writable by its group (mode 664)").
+            const status = (p: (typeof r.list.projects)[number]) => (p.reason ? yellow(`${p.status === "foreign" ? "not trusted" : "invalid"}: ${p.reason}`) : STATUS[p.status]);
+            printTable(r.list.projects.map((p) => [p.file, bold(p.workspace), status(p), dim(localTime(p.trustedAt))]));
+            return;
+          }
+          switch (r.action) {
+            case "trusted":
+              console.log(green(`✓ Trusted ${r.file}`) + ` → workspace ${bold(`"${r.workspace}"`)}` + (r.previous ? dim(` (was "${r.previous}")`) : ""));
+              console.log(dim(`Writes from this project (CLI, and MCP servers started here) may now use "${r.workspace}". Undo with: slacker trust --remove`));
+              break;
+            case "already_trusted":
+              console.log(green(`✓ ${r.file} is already trusted`) + ` → workspace ${bold(`"${r.workspace}"`)}`);
+              break;
+            case "removed":
+              console.log(green(`✓ No longer trusting ${r.file}`) + dim(` (was workspace "${r.workspace}")`));
+              break;
+            case "not_trusted":
+              console.log(yellow(`${r.file} wasn't trusted; nothing changed.`));
+              break;
+          }
+        }
       )
     );
 
@@ -919,13 +1036,13 @@ export async function main(argv: string[] = process.argv, io: Partial<CliIO> = {
     if (e instanceof CommanderError && e.exitCode === 0) return; // --help / --version
     const report = describeError(e, args);
     if (json) {
-      console.log(JSON.stringify({ error: report }, null, 2));
+      console.log(toSafeJson({ error: report }));
     } else if (e instanceof CommanderError) {
       // commander already printed its message.
-      if (report.hint) console.error(report.hint);
+      if (report.hint) console.error(sanitizeForTerminal(report.hint));
     } else {
       // The message is self-contained (it already includes any hint).
-      console.error(`slacker: ${e instanceof Error ? e.message : report.message}`);
+      console.error(`slacker: ${sanitizeForTerminal(e instanceof Error ? e.message : report.message)}`);
     }
     process.exit(e instanceof CommanderError && e.exitCode ? e.exitCode : 1);
   }

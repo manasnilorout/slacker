@@ -6,6 +6,25 @@ import { isPlainObject } from "./util.js";
 const POST_METHODS = new Set(["chat.postMessage", "chat.meMessage", "chat.postEphemeral", "chat.scheduleMessage"]);
 const NOT_SENT = " — the message was NOT sent; try again later.";
 const MAYBE_SENT = " — the message may or may not have been posted; check the conversation before retrying.";
+/** The same two outcomes for the other writes (edit, delete, reaction, status). */
+const NOT_CHANGED = " — the change was NOT made; try again later.";
+const MAYBE_CHANGED = " — the change may or may not have been made; check before retrying.";
+
+/**
+ * Slack errors after which part of the operation may have succeeded (Slack documents this for
+ * fatal_error and internal_error): a post must not be blindly retried.
+ */
+const MAYBE_DONE_CODES = new Set(["fatal_error", "internal_error", "request_timeout", "service_unavailable"]);
+
+/** Writes that change something other than posting a message. */
+const CHANGE_METHODS = new Set(["chat.update", "chat.delete", "reactions.add", "reactions.remove", "users.profile.set"]);
+
+/** What to append to a failed write's error: whether it may have happened. Empty for reads. */
+function outcomeSuffix(method: string, maybe: boolean): string {
+  if (POST_METHODS.has(method)) return maybe ? MAYBE_SENT : NOT_SENT;
+  if (CHANGE_METHODS.has(method)) return maybe ? MAYBE_CHANGED : NOT_CHANGED;
+  return "";
+}
 
 /** Methods that change something in Slack: an HTTP 5xx without a Slack response isn't retried for them. */
 function isWriteMethod(method: string): boolean {
@@ -69,6 +88,8 @@ function hintFor(code: string, method: string): string | undefined {
     case "channel_not_found":
       return "Check the channel name/ID, and that you're a member of private channels.";
     default:
+      // " — " is added by the caller; drop the suffix's own leading separator.
+      if (MAYBE_DONE_CODES.has(code) && outcomeSuffix(method, true)) return `Slack had an internal problem;${outcomeSuffix(method, true).slice(2)}`;
       return undefined;
   }
 }
@@ -172,8 +193,12 @@ function isAmbiguous(e: unknown): boolean {
   return !(code && NOT_SENT_CODES.has(code));
 }
 
-function describeNetworkError(method: string, e: unknown, timeoutMs: number): SlackNetworkError {
-  const suffix = POST_METHODS.has(method) && isAmbiguous(e) ? MAYBE_SENT : "";
+/**
+ * The final network error of a call. For writes it says whether the write may have reached Slack:
+ * `earlierMaybe` is set when an earlier (retried) attempt may have.
+ */
+function describeNetworkError(method: string, e: unknown, timeoutMs: number, earlierMaybe = false): SlackNetworkError {
+  const suffix = outcomeSuffix(method, earlierMaybe || isAmbiguous(e));
   if (isTimeout(e)) {
     return new SlackNetworkError(method, `Network error calling ${method}: timed out after ${formatDuration(timeoutMs)}${suffix}`, e);
   }
@@ -279,7 +304,7 @@ export class SlackAPI {
             continue;
           }
         }
-        throw describeNetworkError(method, e, attemptTimeout);
+        throw describeNetworkError(method, e, attemptTimeout, ambiguousRetry);
       }
       budget.spent += Date.now() - started;
 

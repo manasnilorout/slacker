@@ -3,22 +3,28 @@
  * .mcp.json, after checking that config.json can vouch for the workspace's team.
  */
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync, realpathSync } from "node:fs";
-import { basename, delimiter, join, resolve } from "node:path";
+import { existsSync, lstatSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { basename, delimiter, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { isAuthError } from "./api.js";
 import { entryPath, stripRunNote, withRunNote } from "./command.js";
 import {
   DEFAULT_CONFIG_FILE,
+  inspectOwnedFile,
   PROJECT_FILE,
   ProjectSettingsSchema,
+  recordTrust,
   resolveWorkspace,
   teamAliases,
+  trustedWorkspace,
+  trustFilePath,
+  trustKey,
   WorkspaceSource,
   writeFileAtomic,
 } from "./config.js";
 import { SlackerError } from "./errors.js";
-import { identityProblems, LiveTeam } from "./messages.js";
-import { dim, green, printWarnings, red, shellQuote, yellow } from "./output.js";
+import { identityProblems, LiveTeam, untrustedInitRefusal } from "./messages.js";
+import { supportedNode } from "./node-check.js";
+import { dim, green, printWarnings, red, sanitizeForTerminal, shellQuote, yellow } from "./output.js";
 import { SlackSession } from "./session.js";
 import { errorMessage, formatIssues, isPlainObject } from "./util.js";
 
@@ -56,6 +62,8 @@ interface McpServerEntry {
 
 export interface InitResult {
   projectFile: string | null;
+  /** Where trust for projectFile was recorded (so its workspace may be used for CLI writes); null with --mcp-only. */
+  trustFile: string | null;
   workspace: string;
   readOnly: boolean;
   mcpFile: string | null;
@@ -83,6 +91,46 @@ class Overrides {
   record(kind: "allowAlias" | "replace", what: string): void {
     const flag = this.o[kind] ? (kind === "allowAlias" ? "--allow-alias" : "--replace") : "--force";
     this.done.push(`${flag}: ${what}`);
+  }
+}
+
+/**
+ * init writes into the project directory, which may be an untrusted clone: refuse a project file that
+ * is a symlink leading outside the (real) project directory — init would otherwise parse, merge into
+ * and rewrite whatever it points at (~/.claude.json, config.json …) — or that isn't a regular file.
+ * A symlink that stays inside the project is fine. A missing file is fine (it will be created).
+ */
+function assertSafeProjectPath(file: string, realCwd: string): void {
+  let link;
+  try {
+    link = lstatSync(file);
+  } catch {
+    return; // doesn't exist
+  }
+  if (!link.isSymbolicLink()) {
+    if (!link.isFile()) throw new SlackerError(`${file} is not a regular file. Move it aside, then rerun init. Nothing was written.`, "invalid_file");
+    return;
+  }
+  let target: string;
+  try {
+    target = realpathSync(file);
+  } catch {
+    throw new SlackerError(
+      `${file} is a symlink whose target doesn't exist, so init can't check where it leads. Remove the link, then rerun init. Nothing was written.`,
+      "unsafe_symlink"
+    );
+  }
+  const rel = relative(realCwd, target);
+  // "..real.json" is a file in the project; only ".." itself or "../…" climbs out.
+  if (!rel || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
+    throw new SlackerError(
+      `${file} is a symlink to ${target}, outside this project (${realCwd}). Refusing to read or rewrite it. ` +
+        `Remove the link (or replace it with a regular file), then rerun init. Nothing was written.`,
+      "unsafe_symlink"
+    );
+  }
+  if (!statSync(target).isFile()) {
+    throw new SlackerError(`${file} is a symlink to ${target}, which is not a regular file. Nothing was written.`, "unsafe_symlink");
   }
 }
 
@@ -188,12 +236,6 @@ function nodeVersion(node: string): string | undefined {
   }
 }
 
-/** slacker needs Node ≥ 22.12. */
-function supportedNode(version: string): boolean {
-  const [major, minor] = version.slice(1).split(".").map(Number);
-  return major > 22 || (major === 22 && minor >= 12);
-}
-
 /** The first candidate node outside nvm that is new enough. */
 function findStableNode(candidates: readonly string[]): { path: string; version: string } | undefined {
   for (const path of candidates) {
@@ -270,6 +312,30 @@ async function checkWorkspaceIdentity(name: string, file: string, ov: Overrides,
   ov.record("allowAlias", withRunNote(`pinned "${name}" anyway. ${text}`));
 }
 
+/**
+ * D1: bare `init` must not trust a workspace it took from a .slacker.json you never trusted for it (a
+ * cloned repo's file would otherwise trust itself). Refuses (`untrusted_project`) unless the file is
+ * yours and already trusted for that workspace; nothing has been written yet when this runs.
+ */
+function assertTrustedFallback(fallback: { name?: string; source: WorkspaceSource; projectFile?: string }, o: InitOpts): void {
+  if (fallback.source !== "project" || !fallback.projectFile || !fallback.name) return;
+  const file = fallback.projectFile;
+  const foreign = inspectOwnedFile(file).reason;
+  let detail = foreign ? `: it ${foreign}` : "";
+  if (!foreign) {
+    let recorded: string | undefined;
+    try {
+      recorded = trustedWorkspace(trustKey(file));
+    } catch (e) {
+      detail = ` (the trust record couldn't be read: ${errorMessage(e)})`;
+    }
+    if (recorded === fallback.name) return;
+    if (recorded !== undefined) detail = ` (you trusted it for workspace "${recorded}")`;
+  }
+  const args = o.mcpOnly ? " --mcp-only" : o.mcp ? " --mcp" : "";
+  throw new SlackerError(untrustedInitRefusal(file, fallback.name, detail, args), "untrusted_project", withRunNote(`slacker init ${fallback.name}${args}`));
+}
+
 /** The workspace init pins when none is named: --workspace, SLACKER_WORKSPACE, .slacker.json, defaultWorkspace. */
 function fallbackWorkspace(env: InitEnv, project: Record<string, unknown>, projectFile: string): { name?: string; source: WorkspaceSource; projectFile?: string } {
   const flag = env.workspaceFlag?.trim();
@@ -285,7 +351,15 @@ export async function initProject(names: string[], o: InitOpts, env: InitEnv): P
   const file = env.configFile;
   const { cwd } = env;
   const projectFile = join(cwd, PROJECT_FILE);
+  const mcpFile = join(cwd, ".mcp.json");
   const mcp = !!(o.mcp || o.mcpOnly);
+  // Both files are checked before either is read, and again right before writing (the live check below can take a while).
+  const realCwd = realpathSync(cwd);
+  const checkPaths = () => {
+    assertSafeProjectPath(projectFile, realCwd);
+    if (mcp) assertSafeProjectPath(mcpFile, realCwd);
+  };
+  checkPaths();
   const ov = new Overrides(o);
   const warnings: string[] = [];
   const credentialErrors: string[] = [];
@@ -298,6 +372,7 @@ export async function initProject(names: string[], o: InitOpts, env: InitEnv): P
 
   const project = readProjectFile(projectFile, o, ov, warnings);
   const fallback = fallbackWorkspace(env, project, projectFile);
+  if (!names.length) assertTrustedFallback(fallback, o);
   const workspaces = [...new Set(names.length ? names : [resolveWorkspace(fallback.name, file, fallback).name])];
   for (const name of workspaces) resolveWorkspace(name, file); // validates every name
   if (workspaces.length > 1 && !mcp) throw new SlackerError(`Several workspaces only make sense with --mcp (${PROJECT_FILE} pins one).`, "invalid_argument");
@@ -308,7 +383,6 @@ export async function initProject(names: string[], o: InitOpts, env: InitEnv): P
   const readOnly = o.readOnly ?? project.readOnly === true;
 
   // Validate .mcp.json completely (and plan its entries) before the live check and before writing anything.
-  const mcpFile = join(cwd, ".mcp.json");
   let mcpJson: Record<string, unknown> = {};
   let existingServers: Record<string, unknown> = {};
   const servers: InitResult["servers"] = [];
@@ -376,18 +450,27 @@ export async function initProject(names: string[], o: InitOpts, env: InitEnv): P
 
   for (const name of workspaces) await checkWorkspaceIdentity(name, file, ov, { warnings, credentialErrors });
 
+  checkPaths();
+  let trustFile: string | null = null;
   if (!o.mcpOnly) {
     const next: Record<string, unknown> = { ...project, workspace: workspaces[0] };
     if (o.readOnly !== undefined) next.readOnly = o.readOnly;
-    writeFileAtomic(projectFile, JSON.stringify(next, null, 2) + "\n");
+    // Never group/world-writable: such a .slacker.json isn't trusted (another user could change it).
+    writeFileAtomic(projectFile, JSON.stringify(next, null, 2) + "\n", 0o644, { clearBits: 0o022 });
   }
   if (mcp) {
     const entries = Object.fromEntries(servers.map((s) => [s.name, { command: s.command, args: s.args }]));
     writeFileAtomic(mcpFile, JSON.stringify({ ...mcpJson, mcpServers: { ...existingServers, ...entries } }, null, 2) + "\n");
   }
+  if (!o.mcpOnly) {
+    // You chose this workspace for this project: let the file choose it for CLI writes too.
+    recordTrust(trustKey(projectFile), workspaces[0]);
+    trustFile = trustFilePath();
+  }
 
   return {
     projectFile: o.mcpOnly ? null : projectFile,
+    trustFile,
     workspace: workspaces[0],
     readOnly,
     mcpFile: mcp ? mcpFile : null,
@@ -403,7 +486,8 @@ export async function initProject(names: string[], o: InitOpts, env: InitEnv): P
 export function printInit(r: InitResult, o: InitOpts, configFile: string) {
   if (r.projectFile) {
     const ws = resolveWorkspace(r.workspace, configFile);
-    console.log(green(`✓ Wrote ${PROJECT_FILE}`) + dim(` → workspace "${r.workspace}" (${ws.url})${r.readOnly ? " · read-only" : ""}`));
+    const url = sanitizeForTerminal(ws.url);
+    console.log(green(`✓ Wrote ${PROJECT_FILE}`) + dim(` → workspace "${r.workspace}" (${url})${r.readOnly ? " · read-only" : ""} · trusted on this machine`));
   }
   for (const s of r.servers) {
     console.log(green(`✓ ${s.replaced ? "Updated" : "Registered"} "${s.name}" in .mcp.json`) + dim(` → workspace "${s.workspace}"${s.readOnly ? " · read-only" : ""}`));

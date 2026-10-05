@@ -2,9 +2,22 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { setActiveConfig, stripRunNote, withRunNote } from "./command.js";
-import { chooseWorkspace, configPath, loadConfig, parseBoolEnv, ResolvedWorkspace, teamAliases, WorkspaceChoice } from "./config.js";
+import {
+  chooseWorkspace,
+  configPath,
+  loadConfig,
+  parseBoolEnv,
+  projectReadWarnings,
+  projectWriteBlock,
+  projectWriteWarnings,
+  recheckWriteBlock,
+  ResolvedWorkspace,
+  teamAliases,
+  WorkspaceChoice,
+} from "./config.js";
 import { SlackerError } from "./errors.js";
 import { identityProblems, NOT_CONFIGURED, setupProblem, startupProblem } from "./messages.js";
+import { sanitizeForTerminal } from "./output.js";
 import { registerPrompts } from "./prompts.js";
 import { SlackSession, SlackSessionOptions, MAX_STATUS_MINUTES } from "./session.js";
 import { errorMessage } from "./util.js";
@@ -18,6 +31,8 @@ export interface ServerOptions {
   choice?: WorkspaceChoice;
   /** Startup failed before a workspace could be chosen (e.g. a corrupt .slacker.json). */
   startupError?: string;
+  /** Where .slacker.json is looked up, at startup and again before every write (default: process.cwd()). */
+  cwd?: string;
   /** Passed to SlackSession (tests). */
   sessionOptions?: SlackSessionOptions;
 }
@@ -28,6 +43,13 @@ export interface CreatedServer {
   session?: SlackSession;
   /** Why the server is misconfigured at startup (every tool reports it), or undefined when healthy. */
   problem?: string;
+  /**
+   * Why every write tool refused at startup: an untrusted .slacker.json chose the workspace (or one
+   * someone else controls was found). Writes recheck this on every call (`recheckWriteBlock`).
+   */
+  untrustedProject?: SlackerError;
+  /** How the workspace was chosen. */
+  choice: WorkspaceChoice;
   /** The workspace resolved at startup, when it resolved. */
   workspace?: ResolvedWorkspace;
   readOnly: boolean;
@@ -63,7 +85,7 @@ function availableWorkspaces(file: string): string[] | undefined {
   }
 }
 
-function buildInstructions(o: { ws?: ResolvedWorkspace; problem?: string; readOnly: boolean; aliases: string[] }): string {
+function buildInstructions(o: { ws?: ResolvedWorkspace; problem?: string; readOnly: boolean; aliases: string[]; untrustedProject?: SlackerError }): string {
   const parts: string[] = [];
   // Instructions are sent once, when the client connects: say that their warnings are a snapshot.
   if (o.problem || !o.ws) {
@@ -91,6 +113,11 @@ function buildInstructions(o: { ws?: ResolvedWorkspace; problem?: string; readOn
   );
   if (o.readOnly) {
     parts.push("Read-only mode: the write tools are disabled.");
+  } else if (o.untrustedProject) {
+    parts.push(
+      `When the server started, every write tool refused: ${stripRunNote(o.untrustedProject.message)} ` +
+        "Writes recheck this on every call (whoami shows the current status). Tell the user if they ask for a write; don't work around it."
+    );
   } else {
     parts.push(
       "Only call send_message, edit_message, delete_message, add_reaction or set_status when the user explicitly asked for that in this conversation, and show the exact text and destination first unless the user dictated it verbatim. " +
@@ -147,7 +174,25 @@ export function createServer(opts: ServerOptions = {}): CreatedServer {
   const workspaceName = opts.workspace ?? choice.name;
   const readOnly = !!opts.readOnly || choice.readOnly || parseBoolEnv(process.env.SLACKER_READ_ONLY);
 
-  const sessionOptions: SlackSessionOptions = { source: { source: choice.source, projectFile: choice.projectFile }, ...opts.sessionOptions };
+  // A workspace chosen by an untrusted .slacker.json (no --workspace) can be read but not written.
+  // Checked at startup for the instructions and the log, and again before every write (D3).
+  const untrustedProject = projectWriteBlock(choice, "mcp");
+  const cwd = opts.cwd ?? process.cwd();
+  const flag = choice.source === "flag" ? choice.name : undefined;
+  const writeCheck = () => recheckWriteBlock(choice, { cwd, flag, surface: "mcp" });
+  /** The project-file status right now (undefined when the file can't be read: writeCheck reports why). */
+  const currentChoice = (): WorkspaceChoice | undefined => {
+    try {
+      return chooseWorkspace(flag, cwd);
+    } catch {
+      return undefined;
+    }
+  };
+  const sessionOptions: SlackSessionOptions = {
+    source: { source: choice.source, projectFile: choice.projectFile },
+    writeCheck,
+    ...opts.sessionOptions,
+  };
   const session = opts.startupError === undefined ? new SlackSession(workspaceName, file, sessionOptions) : undefined;
   const atStartup = opts.startupError === undefined ? undefined : startupProblem(opts.startupError);
 
@@ -176,7 +221,7 @@ export function createServer(opts: ServerOptions = {}): CreatedServer {
 
   const server = new McpServer(
     { name: "slacker", version: VERSION },
-    { instructions: buildInstructions({ ws, problem, readOnly, aliases }) }
+    { instructions: buildInstructions({ ws, problem, readOnly, aliases, untrustedProject }) }
   );
 
   /**
@@ -206,18 +251,25 @@ export function createServer(opts: ServerOptions = {}): CreatedServer {
     {
       title: "Who am I",
       description:
-        "Show which Slack workspace, team and user this server acts as (live check), how the workspace was chosen, whether it's read-only, and warnings about shared credentials.",
+        "Show which Slack workspace, team and user this server acts as (live check), how the workspace was chosen, whether it's read-only, whether the project's .slacker.json is trusted right now, and warnings (shared credentials, writes refused).",
       annotations: read,
     },
     tool(async (s) => {
       const me = await s.whoami();
       const warnings = identityProblems(s.workspace(), me.aliases, me).map((p) => p.message);
+      // The project file as it is now (trust may have changed since startup).
+      const now = currentChoice() ?? choice;
+      warnings.push(...projectWriteWarnings(now));
+      const block = readOnly ? undefined : writeCheck();
+      if (block) warnings.push(block.message);
       return {
         ...me,
         source: choice.source,
-        projectFile: choice.projectFile ?? null,
+        projectFile: now.projectFile ?? null,
+        projectTrusted: now.projectTrusted ?? null,
+        ...(now.foreignProject && { ignoredProjectFile: now.foreignProject.file }),
         readOnly,
-        ...(warnings.length && { warning: withRunNote(warnings.join(" ")) }),
+        ...(warnings.length && { warning: withRunNote(warnings.map(stripRunNote).join(" ")) }),
       };
     })
   );
@@ -423,17 +475,20 @@ export function createServer(opts: ServerOptions = {}): CreatedServer {
 
   registerPrompts(server);
 
-  return { server, session, problem, workspace: ws, readOnly };
+  return { server, session, problem, workspace: ws, readOnly, untrustedProject, choice };
 }
 
 /** Log startup state to stderr (stdout is the MCP channel) and check the live identity without blocking. */
-function logStartup({ session, problem, workspace: ws, readOnly }: CreatedServer, file: string): void {
-  const log = (msg: string) => console.error(`[slacker] ${msg}`);
+function logStartup({ session, problem, workspace: ws, readOnly, untrustedProject, choice }: CreatedServer, file: string): void {
+  // stderr may be a terminal (`slacker serve` by hand): team names etc. come from Slack.
+  const log = (msg: string) => console.error(`[slacker] ${sanitizeForTerminal(msg)}`);
   if (problem || !session || !ws) {
     log(`NOT CONFIGURED — every tool will return this error: ${problem}`);
     return;
   }
   log(`serving workspace "${ws.name}" (${ws.url})${readOnly ? " in read-only mode" : ""}`);
+  for (const w of projectReadWarnings(choice)) log(`warning: ${w}`);
+  if (untrustedProject && !readOnly) log(`warning: write tools refuse: ${stripRunNote(untrustedProject.message)}`);
   let aliases: string[] = [];
   try {
     aliases = teamAliases(ws.name, file);
@@ -455,7 +510,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   let { choice, startupError } = opts;
   if (!choice && startupError === undefined) {
     try {
-      choice = chooseWorkspace(opts.workspace);
+      choice = chooseWorkspace(opts.workspace, opts.cwd);
     } catch (e) {
       startupError = errorMessage(e);
     }
