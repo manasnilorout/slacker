@@ -493,7 +493,7 @@ export function inspectOwnedFile(file: string, read = false): OwnedFileCheck {
     const contents = () => (read ? { text: readFileSync(fd, "utf-8") } : {});
     if (!posix) return contents();
     if (st.uid !== uid) return { reason: `is owned by another user (uid ${st.uid})`, fix: "chown it" };
-    for (const dir of new Set([dirname(file), dirname(trustKey(file))])) {
+    for (const dir of new Set([dirname(file), dirname(realLocation(file))])) {
       const open = openDirectory(dir);
       if (open) return open;
     }
@@ -518,25 +518,37 @@ export function foreignReason(file: string): string | undefined {
 }
 
 /**
- * The key trust records use for a file: its canonical realpath (`realpathSync.native`, which also
- * fixes the case on case-insensitive file systems). A missing file is keyed by its directory's realpath.
+ * The key trust records use for a file: its directory's canonical realpath (`realpathSync.native`,
+ * which also fixes the case on case-insensitive file systems) joined with its own name. The file
+ * itself is not followed: a .slacker.json that is a symlink to another project's trusted file is a
+ * different key, so it can't borrow that project's trust (a cloned repo can contain such a link).
  */
 export function trustKey(file: string): string {
   try {
+    if (!lstatSync(file).isSymbolicLink()) return realpathSync.native(file);
+  } catch {
+    // missing: key it by its directory
+  }
+  try {
+    return join(realpathSync.native(dirname(file)), basename(file));
+  } catch {
+    return file;
+  }
+}
+
+/** Where `file` really lives (following symlinks), or `file` itself when that can't be resolved. */
+function realLocation(file: string): string {
+  try {
     return realpathSync.native(file);
   } catch {
-    try {
-      return join(realpathSync.native(dirname(file)), basename(file));
-    } catch {
-      return file;
-    }
+    return file;
   }
 }
 
 export interface ProjectLookup {
   /** The path where it was found. */
   file: string;
-  /** Its canonical realpath (what trust records are keyed by: `trustKey`). */
+  /** The key trust records use for it (its directory's realpath + its name: `trustKey`). */
   realFile: string;
   /** Empty when `foreign` is set (a foreign file isn't parsed). */
   settings: ProjectSettings;

@@ -176,9 +176,12 @@ shared directory such as `/tmp`. So slacker uses a trust model, like direnv's:
   Reads still use the file's workspace, with one warning line on stderr:
   `Warning: Using workspace "acme" from untrusted /path/to/.slacker.json; run slacker trust to silence`.
 - **`-w` and `SLACKER_WORKSPACE` bypass the file's choice** (the file's `readOnly` still applies).
-- **Trust is per file and per workspace.** It's recorded under the file's real path (symlinks resolved), together
-  with the workspace it named. If the workspace in the file changes, it's untrusted again until you re-run
-  `slacker trust`.
+- **Trust is per file and per workspace.** It's recorded under the file's path, with symlinked directories
+  resolved, together with the workspace it named. If the workspace in the file changes, it's untrusted again
+  until you re-run `slacker trust`.
+- **A `.slacker.json` that is a symlink is trusted on its own.** It doesn't inherit the trust of the file it
+  points at, so a cloned repo can't ship `.slacker.json -> ../your-other-project/.slacker.json` to borrow that
+  project's workspace. Run `slacker trust` in the project if you really want the link.
 - **Trust is checked on every write**, in the CLI and in the MCP server: each write (dry runs too) re-reads the
   `.slacker.json` and the trust records first. `slacker trust` and `trust --remove` take effect on the next write
   tool call, without reconnecting the server. If the file now picks a different workspace than the server (or

@@ -668,12 +668,32 @@ describe("chooseWorkspace and project trust", () => {
     expect(chooseWorkspace(undefined, dir).foreignProject?.reason).toBe("is not a regular file");
   });
 
-  it("an owned symlink to an owned file is fine and trust is keyed by the realpath", () => {
+  it("a symlink to another project's trusted file doesn't borrow its trust; trusting the link itself works", () => {
     const p = project({ workspace: "acme" });
-    const linkDir = mkdtempSync(join(root, "trust-link-"));
-    symlinkSync(p.file, join(linkDir, ".slacker.json"));
     recordTrust(p.real, "acme");
-    expect(chooseWorkspace(undefined, linkDir)).toMatchObject({ source: "project", projectTrusted: true, projectFile: join(linkDir, ".slacker.json") });
+    // e.g. a cloned repo shipping .slacker.json -> ../your-trusted-project/.slacker.json
+    const linkDir = mkdtempSync(join(root, "trust-link-"));
+    const link = join(linkDir, ".slacker.json");
+    symlinkSync(p.file, link);
+    expect(trustKey(link)).toBe(join(realpathSync.native(linkDir), ".slacker.json"));
+    let c = chooseWorkspace(undefined, linkDir);
+    expect(c).toMatchObject({ source: "project", name: "acme", projectTrusted: false, projectFile: link });
+    expect(projectWriteBlock(c)).toMatchObject({ code: "untrusted_project" });
+    // The original project is still trusted, and trusting the link (an owned link to an owned file) works.
+    expect(chooseWorkspace(undefined, p.dir).projectTrusted).toBe(true);
+    recordTrust(trustKey(link), "acme");
+    c = chooseWorkspace(undefined, linkDir);
+    expect(c.projectTrusted).toBe(true);
+    expect(projectWriteBlock(c)).toBeUndefined();
+  });
+
+  it("a symlinked project directory still resolves to the same trust key", () => {
+    const p = project({ workspace: "acme" });
+    recordTrust(p.real, "acme");
+    const alias = join(mkdtempSync(join(root, "trust-alias-")), "proj");
+    symlinkSync(p.dir, alias);
+    expect(trustKey(join(alias, ".slacker.json"))).toBe(p.real);
+    expect(chooseWorkspace(undefined, alias).projectTrusted).toBe(true);
   });
 });
 

@@ -158,8 +158,9 @@ describe("init refuses symlinks that lead outside the project (unsafe_symlink)",
     expect(lstatSync(join(cwd, ".slacker.json")).isSymbolicLink()).toBe(true);
     expect(JSON.parse(readFileSync(join(cwd, "config", "slacker.json"), "utf-8"))).toEqual({ note: "kept", workspace: "work" });
     expect(Object.keys(JSON.parse(readFileSync(join(cwd, "config", "mcp.json"), "utf-8")).mcpServers)).toEqual(["slacker"]);
-    // Trust is recorded for the file the link resolves to.
-    expect(trustedWorkspace(realpathSync(join(cwd, "config", "slacker.json")))).toBe("work");
+    // Trust is recorded for the project's .slacker.json itself (the link), not the file it points at.
+    expect(trustedWorkspace(trustKey(join(cwd, ".slacker.json")))).toBe("work");
+    expect(trustedWorkspace(realpathSync(join(cwd, "config", "slacker.json")))).toBeUndefined();
   });
 
   it("B-P2-1: a symlink to a project file whose name starts with \"..\" stays inside the project", async () => {
