@@ -893,7 +893,10 @@ describe("init (R18, R19)", () => {
     writeFileSync(mcpFile(), JSON.stringify({ mcpServers: {} }));
     const before = [statSync(projectFile()).ino, statSync(mcpFile()).ino];
     expect((await run(["init", "work", "--mcp", "--command", "slacker"])).code).toBe(0);
-    expect([statSync(projectFile()).ino, statSync(mcpFile()).ino]).not.toContain(before[0]);
+    // Compare each file with its own old inode only: the inode freed by replacing one file may be
+    // reused for the next file's temp file (ext4 does this), but a temp file never gets the inode of
+    // the file it replaces, since that file still exists while the temp file is created.
+    expect(statSync(projectFile()).ino).not.toBe(before[0]);
     expect(statSync(mcpFile()).ino).not.toBe(before[1]);
     expect(lstatSync(projectFile()).isFile()).toBe(true);
   });
