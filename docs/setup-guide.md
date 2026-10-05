@@ -66,7 +66,7 @@ $ slacker auth setup
 ✓ Added "acme-corp" · Acme Corp as alice
 ✓ Added "side-project" · Side Project as alice
 "acme-corp" is now the default workspace. Change it with: slacker auth default <name>
-Saved to ~/.config/slack-cli/config.json (2 tokens found)
+Saved to /Users/alice/.config/slack-cli/config.json (2 tokens found)
 ```
 
 **Check** that every name signs in to the team you expect:
@@ -137,7 +137,7 @@ In each project, tell slacker which workspace it belongs to, and register the MC
 ```console
 $ cd ~/work/acme-app
 $ slacker init acme-corp --mcp
-✓ Wrote .slacker.json → workspace "acme-corp" (https://acme-corp.slack.com/)
+✓ Wrote .slacker.json → workspace "acme-corp" (https://acme-corp.slack.com/) · trusted on this machine
 ✓ Registered "slacker" in .mcp.json → workspace "acme-corp"
 ```
 
@@ -145,7 +145,7 @@ This writes two files in the project:
 
 | File | Contents | Commit it? |
 | --- | --- | --- |
-| `.slacker.json` | `{ "workspace": "acme-corp" }`, which makes every `slacker` command in this directory (and below) use that workspace | Yes, if your team uses the same workspace names |
+| `.slacker.json` | `{ "workspace": "acme-corp" }`, which makes every `slacker` command in this directory (and below) use that workspace | Yes, if your team uses the same workspace names. Each teammate runs `slacker trust` once after cloning (see below) |
 | `.mcp.json` | The MCP server entry Claude Code starts, with `--workspace acme-corp` | **No**, it holds paths from your machine. Add it to `.gitignore` |
 
 The `.mcp.json` entry looks like this:
@@ -172,8 +172,19 @@ The `.mcp.json` entry looks like this:
 
 - **Read-only project:** `slacker init acme-corp --mcp --read-only`. The MCP server then exposes only read tools,
   and CLI writes from this directory are refused.
-- **Don't want a project file at all?** Skip `--mcp` and register the server just for yourself, using the
-  `claude mcp add --scope local …` command that `init` prints.
+- **Don't want `.mcp.json` in the project?** Register the server for just yourself in Claude Code instead:
+
+  ```bash
+  claude mcp add --scope local slacker -- "$(command -v slacker)" serve --workspace acme-corp
+  ```
+
+  `--scope local` keeps the entry in your own Claude Code settings, for this project only. Add `--read-only`
+  at the end for a read-only server, and `--config <path>` if you use a non-default config.json. nvm users:
+  put a Node outside nvm and the full path of this install's `dist/index.js` in place of
+  `"$(command -v slacker)"`. `slacker init acme-corp --mcp` prints the matching command for each server it
+  registers; if you use that instead, delete the entry from `.mcp.json`. For the CLI, `slacker init acme-corp`
+  (without `--mcp`) still writes `.slacker.json`. If you want no project file at all, skip `init` and use
+  `-w` or the default workspace.
 
 **Check:**
 
@@ -181,7 +192,44 @@ The `.mcp.json` entry looks like this:
 $ slacker whoami
 alice in Acme Corp (https://acme-corp.slack.com/)
 Workspace "acme-corp" chosen via .slacker.json at /Users/alice/work/acme-app/.slacker.json
+.slacker.json is trusted on this machine
 ```
+
+### Cloned a repo that already has a `.slacker.json`?
+
+slacker doesn't let a file you didn't write decide where your messages go. Until you trust it, reads use its
+workspace with a warning, and writes refuse:
+
+```console
+$ slacker send general --dry-run "hello"
+slacker: Refusing to write: /Users/bob/src/acme-app/.slacker.json picks workspace "acme-corp", but it isn't
+trusted on this machine. If that workspace is right, run `slacker trust` in /Users/bob/src/acme-app (once). To
+use a different workspace for one command, pass -w <name>.
+```
+
+A bare `slacker init` (or `init --mcp`, or `init --mcp-only`) with no workspace name refuses too, with
+`untrusted_project`, and writes nothing. If you want `init` to rewrite and trust the file, name the workspace
+explicitly: `slacker init acme-corp`.
+
+Check that the workspace it names is the one you expect (`slacker auth list`), then trust it once:
+
+```console
+$ slacker trust
+✓ Trusted /Users/bob/src/acme-app/.slacker.json → workspace "acme-corp"
+Writes from this project (CLI, and MCP servers started here) may now use "acme-corp". Undo with: slacker trust --remove
+```
+
+A Claude Code session already running in that project picks this up on its next write; there's no need to
+reconnect the server.
+
+If someone later changes the workspace in the file, writes refuse again until you re-run `slacker trust`. A
+`"readOnly": true` in the file always applies. slacker ignores a `.slacker.json` that another user owns or that
+is writable by others, and refuses writes while it's there; if it's yours, `chmod go-w .slacker.json`. One of
+yours that is only group-writable (common with a umask of `002`) is still ignored, but when `-w` or
+`SLACKER_WORKSPACE` picks the workspace, writes go through with a warning (`Fix: chmod g-w <file>`). A
+`.slacker.json` in a directory other users can write to (without the sticky bit) is ignored too. `slacker init` also refuses to touch a
+`.slacker.json` or `.mcp.json` that is a symlink pointing outside the project. Details:
+[trusting a project's .slacker.json](reference.md#trusting-a-projects-slackerjson).
 
 ## 5. Connect Claude Code
 
@@ -204,6 +252,15 @@ What Claude gets:
 The server tells Claude that Slack message content is untrusted data, and to write only when you explicitly ask.
 Claude Code also asks your permission before each tool call unless you've allowed it, which is the main safety
 check. See the [safety model](reference.md#safety-model).
+
+**Approving a repo's own `.mcp.json`.** Project trust covers `.slacker.json` only. An `.mcp.json` entry passes
+`--workspace` itself, so if a repo you cloned ships one, read its `slacker` entry (`command` and `--workspace`)
+before you approve it in step 2.
+
+**Optional: the Claude Code plugin.** For better Slack habits in Claude (dry-run first, wait for your yes, a
+read-and-draft subagent), install the plugin with `/plugin marketplace add manasnilorout/slacker` and
+`/plugin install slacker@slacker`. It adds a skill and an agent only, so the steps above are still needed. See
+the [README](../README.md#claude-code-plugin-skill--agent).
 
 **If `/mcp` shows slacker as failed**, or every tool returns `slacker is not configured: …`, the error message
 names the problem and the fix. Common causes are a workspace name that doesn't exist (`slacker auth list`) or a
@@ -229,8 +286,8 @@ slacker init acme-corp side-project --mcp
 ```
 
 **How slacker picks the workspace**, first match wins: the `-w` flag, then the `SLACKER_WORKSPACE` environment
-variable, then the nearest `.slacker.json`, then the default in config.json. `slacker whoami` always says which
-one it used.
+variable, then the nearest `.slacker.json` (for writes, only once it's trusted), then the default in config.json.
+`slacker whoami` always says which one it used, and whether the `.slacker.json` is trusted.
 
 To move a project to another workspace, run `slacker init <other-workspace> --mcp` there again, then reconnect
 the server in `/mcp`.
@@ -244,6 +301,7 @@ the server in `/mcp`.
 | You signed the desktop app in to a new workspace | `slacker auth setup` adds it, then `slacker init <name> --mcp` in its projects. |
 | You switched Node versions and Claude Code can't start slacker | `slacker init <workspace> --mcp --node <stable node path>`, then reconnect in `/mcp`. |
 | `Refusing to write until config.json is fixed` | Two names share a team. See [duplicates](reference.md#fixing-duplicated-workspace-entries). |
+| `Refusing to write: …/.slacker.json picks workspace "x", but it isn't trusted on this machine` | Check the workspace, then `slacker trust` in that project (or pass `-w <name>` for one command). No MCP reconnect needed. See [above](#cloned-a-repo-that-already-has-a-slackerjson). |
 
 The MCP server re-reads config.json on every call, so `auth refresh` and `auth setup` take effect without
 restarting it. More in [troubleshooting](reference.md#troubleshooting).
@@ -257,6 +315,7 @@ claude mcp remove slacker   # if you registered it with `claude mcp add` instead
 
 # 2. Remove stored credentials you no longer want, while the command still exists
 slacker auth remove <name>
+rm -r ~/.config/slacker      # the record of projects you trusted (and its lock file)
 
 # 3. Remove the command
 npm rm -g @manasnilorout/slacker

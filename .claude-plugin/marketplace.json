@@ -1,0 +1,16 @@
+{
+  "name": "slacker",
+  "owner": {
+    "name": "Manas Nilorout"
+  },
+  "metadata": {
+    "description": "slacker: Slack as yourself from Claude Code (skill, agent and CLI/MCP docs)"
+  },
+  "plugins": [
+    {
+      "name": "slacker",
+      "source": "./plugin",
+      "description": "Read, search and send Slack messages as yourself through the slacker CLI or its MCP server"
+    }
+  ]
+}
