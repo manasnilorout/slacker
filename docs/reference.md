@@ -131,7 +131,7 @@ The first match wins:
 | --- | --- | --- |
 | 1 | `-w/--workspace <name>` flag | `slacker read general -w acme` |
 | 2 | `SLACKER_WORKSPACE` environment variable | `SLACKER_WORKSPACE=acme slacker unread` |
-| 3 | The nearest `.slacker.json`, searched upward from the current directory | `{ "workspace": "acme" }` |
+| 3 | The nearest `.slacker.json`, searched upward from the current directory (for writes, only once [trusted](#trusting-a-projects-slackerjson)) | `{ "workspace": "acme" }` |
 | 4 | `defaultWorkspace` in config.json | `slacker auth default acme` |
 
 `slacker whoami` shows the workspace in use, the live team and user, and which of these four chose it. An
@@ -151,12 +151,100 @@ Write commands (`send` including `--dry-run`, `edit`, `delete`, `react`, `status
 while it's invalid, even with `-w`, because it may say `"readOnly": true`. `slacker serve` starts in
 [degraded mode](#degraded-mode).
 
-`.slacker.json` holds just a workspace name and optional `"readOnly": true`, which is safe to commit if your
-team uses the same workspace names.
+`.slacker.json` holds just a workspace name and optional `"readOnly": true`. You can commit it if your team uses
+the same workspace names, but on each machine it only chooses the workspace for writes once it's trusted there
+(next section).
+
+### Trusting a project's `.slacker.json`
+
+A `.slacker.json` can come from anywhere: a repo you cloned, or another user of the machine writing one into a
+shared directory such as `/tmp`. So slacker uses a trust model, like direnv's:
+
+- **Restricting is always allowed.** `"readOnly": true` is honoured whether or not the file is trusted.
+- **Choosing the workspace for writes needs trust.** When the workspace comes from `.slacker.json` (no `-w`, no
+  `SLACKER_WORKSPACE`), the write commands — `send` (including `--dry-run`), `edit`, `delete`, `react`,
+  `status --set/--clear` — refuse with code `untrusted_project` unless you trusted that file **for that workspace**:
+
+  ```
+  Refusing to write: /path/to/.slacker.json picks workspace "acme", but it isn't trusted on this machine. If that
+  workspace is right, run `slacker trust` in /path/to (once). To use a different workspace for one command, pass
+  -w <name>.
+  ```
+
+  Over MCP the error asks the agent to have the user check the file and run `slacker trust`, and leaves out `-w`.
+
+  Reads still use the file's workspace, with one warning line on stderr:
+  `Warning: Using workspace "acme" from untrusted /path/to/.slacker.json; run slacker trust to silence`.
+- **`-w` and `SLACKER_WORKSPACE` bypass the file's choice** (the file's `readOnly` still applies).
+- **Trust is per file and per workspace.** It's recorded under the file's path, with symlinked directories
+  resolved, together with the workspace it named. If the workspace in the file changes, it's untrusted again
+  until you re-run `slacker trust`.
+- **A `.slacker.json` that is a symlink is trusted on its own.** It doesn't inherit the trust of the file it
+  points at, so a cloned repo can't ship `.slacker.json -> ../your-other-project/.slacker.json` to borrow that
+  project's workspace. Run `slacker trust` in the project if you really want the link.
+- **Trust is checked on every write**, in the CLI and in the MCP server: each write (dry runs too) re-reads the
+  `.slacker.json` and the trust records first. `slacker trust` and `trust --remove` take effect on the next write
+  tool call, without reconnecting the server. If the file now picks a different workspace than the server (or
+  command) started with, or the file is gone, the write is refused with `project_changed` until you restart the
+  server (`/mcp` → reconnect) or rerun the command. If the file now says `"readOnly": true`, writes refuse with
+  `read_only`.
+- **`slacker init <workspace>` trusts the `.slacker.json` it writes** (not with `--mcp-only`, which doesn't write
+  one).
+- **A bare `slacker init` doesn't trust a file for you.** With no workspace name (and no `-w` or
+  `SLACKER_WORKSPACE`), `init` takes the workspace from the existing `.slacker.json`. If that file isn't trusted
+  for that workspace, or someone else controls it, `init` (with or without `--mcp` or `--mcp-only`) refuses with
+  `untrusted_project` before any Slack call, and writes nothing: no `.slacker.json`, no `.mcp.json`, no trust
+  record.
+  ```
+  .slacker.json at /path/to/.slacker.json says workspace "acme", but you haven't trusted it on this machine.
+  Check that it's right, then name it explicitly: slacker init acme --mcp. Nothing was written.
+  ```
+  The suggested command repeats the mode you used (none, `--mcp` or `--mcp-only`).
+  A file already trusted for its workspace works with a bare `init` as before.
+
+**Teammates:** after cloning a repo with a `.slacker.json`, check the workspace it names (`slacker whoami` shows
+it and whether the file is trusted), then run `slacker trust` once in the repo. Or run
+`slacker init <workspace>`, which also rewrites the file.
+
+| Command | What it does |
+| --- | --- |
+| `slacker trust` | Trusts the nearest `.slacker.json` as it is now and prints its path and workspace. The workspace must exist in config.json. |
+| `slacker trust --remove [file]` | Stops trusting the nearest `.slacker.json`, or `file` (which may no longer exist). |
+| `slacker trust --list` | Lists trusted files, flagging ones that are missing, invalid (`invalid: <parse error>`), or now name another workspace. One ignored for its ownership or permissions shows `not trusted: <reason>`, for example `not trusted: is writable by its group (mode 664)`. With `--json`, those entries carry a `reason` field. |
+
+Trust records live in `~/.config/slacker/trusted-projects.json` (directory `0700`, file `0600`, written
+atomically under a lock); `SLACKER_TRUST_FILE` points elsewhere. A corrupt trust file counts as no trust: writes
+are refused with a message naming it (`invalid_trust_file` from `slacker trust`); fix or delete it. The trust
+file gets the same ownership and permission checks as a `.slacker.json` (below). If someone else owns it or
+could change it, slacker ignores it (`Ignoring the trust file …`), no `.slacker.json` counts as trusted, and
+`slacker trust` and `trust --list` fail with `invalid_trust_file`. Reads still work, with a warning.
+
+**Ownership and permissions.** A `.slacker.json` (and, if it's a symlink, the link itself) must be owned by you, be
+a regular file, and not be writable by group or others. Its directory must not be writable by other users unless
+it has the sticky bit (`is in <dir>, which other users can write to (mode 777, no sticky bit)`; fix with
+`chmod o-w <dir>`, or move the project). slacker opens the file once and checks and reads that same descriptor.
+Otherwise someone else could have written it or could
+change it, so slacker **ignores** it: reads fall through to the next source (`SLACKER_WORKSPACE`, then
+`defaultWorkspace`) with a warning, and writes are refused (`untrusted_project`) even with `-w`, because the file
+might say `"readOnly": true`. `slacker trust` refuses such a file too. Fix your own file with
+`chmod go-w .slacker.json` (a umask of `002` makes new files group-writable), or delete it. `slacker init`
+always writes the file without group/other write bits. Ownership isn't checked on Windows.
+
+One exception: a file **you own** that is only group-writable doesn't block writes when `-w` or
+`SLACKER_WORKSPACE` picks the workspace. The file then only contributes its `readOnly`, and slacker prints a
+warning on stderr for reads and writes:
+`Warning: <file> is writable by its group (mode 664), so only its "readOnly" is used (-w picks the workspace); without -w it's ignored and writes are refused. Fix: chmod g-w <file>`.
+Without `-w` or `SLACKER_WORKSPACE` it is ignored as above, and `slacker trust` still refuses it. A file owned
+by someone else, or writable by others, still blocks writes even with `-w`.
 
 **MCP entries written by `init` pin `--workspace` explicitly**, so the server doesn't depend on its working
 directory or environment. To point a project's MCP server at a different workspace, re-run `slacker init`
 (see below). Editing `.slacker.json` alone won't change it.
+
+**Trust doesn't cover `.mcp.json`.** Because the entry passes `--workspace`, the server's `source` is `flag`
+and no trust check applies. A repo can commit its own `.mcp.json` that runs `slacker serve --workspace prod`,
+and the only gate is Claude Code's approval prompt for project servers. Before you approve a project's
+`slacker` server, read that entry's `--workspace` (and its `command`).
 
 ## Project setup: `slacker init`
 
@@ -172,7 +260,7 @@ slacker init [workspaces...] [--mcp] [--mcp-only] [--name <server>] [--read-only
 
 | Option | Effect |
 | --- | --- |
-| `[workspaces...]` | Workspace names from config.json. Default: `--workspace`, then `SLACKER_WORKSPACE`, then an existing `.slacker.json`, then `defaultWorkspace`. Every name is validated and checked live with `auth.test` (see below). |
+| `[workspaces...]` | Workspace names from config.json. Default: `--workspace`, then `SLACKER_WORKSPACE`, then an existing `.slacker.json` (only if you [trusted](#trusting-a-projects-slackerjson) it for that workspace; otherwise `init` refuses with `untrusted_project` and writes nothing), then `defaultWorkspace`. Every name is validated and checked live with `auth.test` (see below). |
 | *(no flags)* | Writes `./.slacker.json` with the first workspace. Existing keys such as `readOnly` are kept. |
 | `--mcp` | Also adds or updates the MCP server entry in `./.mcp.json`. Other entries are left alone. |
 | `--mcp-only` | Writes only `.mcp.json` and leaves `.slacker.json` alone. |
@@ -188,13 +276,22 @@ slacker init [workspaces...] [--mcp] [--mcp-only] [--name <server>] [--read-only
 the live check below, so a typo never waits on Slack. Without `--mcp`/`--mcp-only` they do nothing, and `init`
 warns that it ignored them.
 
+`init` refuses (code `unsafe_symlink`) when `.slacker.json` or `.mcp.json` is a symlink that leads outside the
+project directory (after resolving symlinks in both), dangles, or points at something that isn't a regular file.
+A cloned repo could otherwise make `init` read, merge into and rewrite any file of yours, such as
+`~/.claude.json` or config.json. Nothing is written, and the error names the link and its target. Symlinks that
+stay inside the project are followed as before. Both files are checked before either is read, and again just
+before writing.
+
 Before writing anything, `init` reads and validates any existing `.mcp.json` and `.slacker.json` (the latter with
 the same rules the CLI and server use, so `"readOnly": "yes"` is rejected). If a file is malformed, nothing is
 written and the error names the file. With `--mcp-only`, `.slacker.json` isn't written, so an invalid one is left
 untouched instead: `init` carries on and warns that an MCP server started from that directory will start
 [degraded](#degraded-mode) until you fix it. Both files are then written atomically. A non-default config file (`-c` or
-`SLACKER_CONFIG`) is added to the entry as `--config <absolute path>`. `--json` prints the result as an object,
-including `overridden` (what `--allow-alias`/`--replace` let through) and `warnings`.
+`SLACKER_CONFIG`) is added to the entry as `--config <absolute path>`. The `.slacker.json` it writes is
+[trusted](#trusting-a-projects-slackerjson) for its workspace and never left writable by group or others.
+`--json` prints the result as an object, including `trustFile`, `overridden` (what `--allow-alias`/`--replace`
+let through) and `warnings`.
 
 The live check refuses, each with its own fix: a duplicated name (`auth list` → `auth remove <copy>` → `auth setup`),
 a team mismatch (`auth setup`, or `auth remove <name>`), and a missing `teamId` (`auth setup`). Pass
@@ -224,8 +321,11 @@ A typical entry:
 Things to know:
 
 - **This `.mcp.json` is personal.** It contains your workspace names, and often absolute paths on your machine.
-  Add it to `.gitignore`, or skip `--mcp` and register the server for just yourself with the command `init` prints:
-  `claude mcp add --scope local slacker -- /opt/homebrew/bin/slacker serve --workspace acme`.
+  Add it to `.gitignore`. Or don't write it: register the server for just yourself with
+  `claude mcp add --scope local slacker -- "$(command -v slacker)" serve --workspace acme` (add `--read-only` or
+  `--config <path>` as needed). `init --mcp` prints the matching `claude mcp add` command for each server it
+  registers; if you use that, delete the entry from `.mcp.json`. Without `--mcp`, `init` writes only
+  `.slacker.json` and prints no command.
 - **Approve the server.** Claude Code asks you to approve project MCP servers from `.mcp.json` the next time it
   starts. Check them with `/mcp`, which is also where you reconnect a server.
 - **nvm users:** the entry runs a Node path like `~/.nvm/versions/node/v24.x/bin/node`, which breaks when you
@@ -311,6 +411,10 @@ slacker delete <message-link>               # checks, then asks (showing where);
 slacker react <message-link> eyes           # eyes or :eyes:
 slacker status --set "Focusing" --emoji :headphones: --expires 60
 slacker status --clear
+
+# Project trust (see "Trusting a project's .slacker.json")
+slacker trust                               # let this project's .slacker.json choose the workspace for writes
+slacker trust --list                        # or: --remove [file]
 ```
 
 | Command | Options |
@@ -326,13 +430,16 @@ slacker status --clear
 | `edit <target> <text>` | `--ts <ts>`, `--allow-alias` |
 | `delete <target>` | `--ts <ts>`, `-y/--yes`, `--allow-alias` |
 | `react <target> <emoji>` | `--ts <ts>`, `--allow-alias` |
+| `trust` | `--remove [file]`, `--list`. See [trust](#trusting-a-projects-slackerjson) |
 | `init`, `auth …`, `serve` | See [init](#project-setup-slacker-init), [credentials](#credentials), [MCP](#mcp-server) |
 
 Numbers must be whole numbers in range. `-n abc`, `-n 10abc`, and `-n 0` are errors. A mistyped command
 gets a suggestion, for example `unknown command 'sned' (Did you mean send?)`.
 
 Every write prints where it landed: `→ #general · team "Acme" (workspace "acme")`. A dry run prints
-`Would send to …` (for a person, `@handle (Real Name)`) and `Dry run — nothing was sent.` `--allow-alias` is
+`Would send to …` (for a person, `@handle (Real Name)`), your text, and `Dry run — nothing was sent.` Control
+and bidi characters in your own text are shown as visible escapes (`\r`, `\x1b`, `\u202e` …) instead of being
+stripped, so the preview matches what will be sent. Slack-authored text is still stripped. `--allow-alias` is
 explained under [duplicates](#fixing-duplicated-workspace-entries); it never bypasses a team mismatch.
 
 `delete` validates the ts, verifies the workspace's team (the same checks every write makes) and resolves the
@@ -344,9 +451,16 @@ without a prompt; answering anything but `y` cancels (code `cancelled`).
 
 With `--json`, a command prints the JSON object the session returns, which is what the matching MCP tool returns
 **minus** what the server adds: MCP read results also carry `untrusted_content_notice`. `whoami` (CLI and MCP)
-includes `source`, `projectFile`, `readOnly`, and a `warning` when names share a team, the team doesn't match
-config.json, or config.json has no `teamId`; `auth test --json` includes the same `warning`. A dry-run `send`
-also echoes `text`.
+includes `source`, `projectFile`, `projectTrusted` (`true`/`false` when `projectFile` names a workspace, else
+`null`), `ignoredProjectFile` (a `.slacker.json` [ignored for its ownership/permissions](#trusting-a-projects-slackerjson)),
+`readOnly`, and a `warning` when names share a team, the team doesn't match config.json, or config.json has no
+`teamId`; `auth test --json` includes the same `warning`. A dry-run `send` also echoes `text`.
+
+`--json` output isn't [sanitized](#safety-model), so Slack text round-trips exactly, but it is escaped so it's
+safe to print. Besides the control characters U+0000–U+001F that JSON always escapes (an ESC appears as
+`\u001b`), slacker also writes DEL and the C1 controls (U+007F–U+009F) and the bidi overrides and isolates
+(U+202A–U+202E, U+2066–U+2069) as `\uXXXX` escapes (lowercase hex, like `\u009b`), in results and errors alike. The output is still valid JSON
+and parses back to the identical string. LRM and RLM (U+200E, U+200F) are left as they are.
 
 Errors print to **stdout** as JSON, with exit code 1:
 
@@ -358,17 +472,23 @@ Errors print to **stdout** as JSON, with exit code 1:
 
 - Slack error codes such as `invalid_auth` or `ratelimited`, and `http_error` when Slack answered with
   something that isn't JSON (e.g. an HTTP 502 page), `network_error` when it didn't answer at all.
-- Targets and writes: `channel_not_found`, `user_not_found`, `ambiguous_user`, `directory_too_large`,
+- Targets and writes: `invalid_target`, `channel_not_found`, `user_not_found`, `ambiguous_user`, `directory_too_large`,
   `cross_workspace_link`, `workspace_alias`, `team_mismatch`, `team_unverified`, `invalid_time`, `invalid_ts`,
-  `missing_ts`, `broadcast_without_thread`, `invalid_status`, `read_only`, `confirmation_required`, `cancelled`.
+  `missing_ts`, `broadcast_without_thread`, `invalid_status`, `read_only`, `project_changed` (the `.slacker.json`
+  now picks another workspace than the command started with), `untrusted_project` (an untrusted
+  `.slacker.json` chose the workspace, or one someone else controls was found; also from a bare `init`),
+  `confirmation_required`, `cancelled`.
 - Configuration: `workspace_not_found`, `no_workspaces`, `no_default_workspace`, `invalid_config` (config.json),
   `invalid_project_file` (`.slacker.json`), `config_locked`, `workspace_exists`, `invalid_workspace_name`,
-  `no_tokens` and `extraction_failed` (`auth setup`/`refresh`), and for `init` `invalid_file` and `mcp_entry_exists`.
+  `no_tokens` and `extraction_failed` (`auth setup`/`refresh`), for `init` `invalid_file`, `mcp_entry_exists` and
+  `unsafe_symlink`, and for `trust` `no_project_file` and `invalid_trust_file`.
 - Arguments: `invalid_argument`, `unknown_command`, `unquoted_text`, and commander codes such as
   `commander.invalidArgument`.
+- `unsupported_node`: Node.js is older than 22.12. slacker checks this before anything else and exits with
+  code 1.
 
 Without `--json`, errors go to stderr as `slacker: <message>`; the message already contains the fix, so the hint
-isn't repeated.
+isn't repeated. Like all human-readable output, the message is [sanitized](#safety-model) first.
 
 ## MCP server
 
@@ -377,7 +497,7 @@ slacker serve [--read-only]       # plus the global -w / -c
 ```
 
 Register it with `slacker init <workspace> --mcp` (see above), with
-`claude mcp add --scope local slacker -- slacker serve --workspace <workspace>`, or by writing the
+`claude mcp add --scope local slacker -- "$(command -v slacker)" serve --workspace <workspace>`, or by writing the
 `.mcp.json` entry yourself. To use several workspaces in one client, register one server per workspace
 (`slacker init acme side --mcp`). Logs go to stderr, because stdout carries the protocol. Results are compact JSON.
 
@@ -385,7 +505,7 @@ Register it with `slacker init <workspace> --mcp` (see above), with
 
 | Tool | Parameters | Notes |
 | --- | --- | --- |
-| `whoami` | none | Live team and user, workspace name, `source`, `projectFile`, `readOnly`, `aliases`, and a `warning` when names share a team or the team doesn't match config |
+| `whoami` | none | Live team and user, workspace name, `source` (how the workspace was chosen at startup), `projectFile`, `projectTrusted`, `ignoredProjectFile` (these three as they are at call time), `readOnly`, `aliases`, and a `warning` when names share a team, the team doesn't match config, writes are refused because of an [untrusted `.slacker.json`](#trusting-a-projects-slackerjson), or your own `.slacker.json` is group-writable |
 | `read_messages` | `target`, `limit` 1–200 (20), `oldest`, `latest`, `cursor` | Oldest first. `nextCursor` fetches older messages. |
 | `read_thread` | `target`, `ts`, `limit` 1–1000 (100), `cursor` | `ts` is optional with a message link. Page while `hasMore`. |
 | `search_messages` | `query`, `limit` 1–100 (20), `sort` `timestamp`\|`score`, `page` 1–100 | Slack search syntax (`in:`, `from:`, `has:`, `before:`, `after:` …). DMs are labelled `@name`. |
@@ -406,6 +526,17 @@ refused with no override in MCP; see [duplicates](#fixing-duplicated-workspace-e
 call aborts only its final Slack write request (`chat.postMessage`, `chat.update`, …): lookups already under way
 (`auth.test`, resolving the channel or person) finish, but the write is never started once the call is cancelled.
 A post cancelled while in flight may or may not have reached Slack, and the error says so.
+
+**Untrusted `.slacker.json`.** Entries written by `init` pass `--workspace` explicitly, so they don't depend on
+`.slacker.json`. When `slacker serve` runs **without** `--workspace` and the workspace comes from a `.slacker.json`
+you haven't [trusted](#trusting-a-projects-slackerjson), the read tools work but every write tool (dry runs too)
+returns an `untrusted_project` error; the same goes for a `.slacker.json` that someone else controls. Over MCP
+the error tells the agent to ask the user to check the file and run `slacker trust` in that directory, and doesn't
+offer `-w`. Trust is checked again on every write call, so after `slacker trust` (or `trust --remove`) the next
+call sees it, with no reconnect. If the `.slacker.json` now picks a different workspace than the server started
+with, or is gone, writes refuse with `project_changed` and ask you to restart the server (`/mcp` → reconnect).
+`whoami` reports the status as it is at that moment; the server instructions and the stderr log describe it as it
+was at startup.
 
 Results from every read tool except `whoami` (`read_messages`, `read_thread`, `search_messages`, `list_channels`,
 `find_user`, `list_unread`, `get_status`) start with
@@ -434,7 +565,9 @@ Any one of these turns it on:
 
 In MCP, the write tools aren't registered at all. In the CLI, the last two settings make `send`, `edit`,
 `delete`, `react`, and `status --set/--clear` refuse with `Refusing to write: this project is read-only (…)`.
-`send --dry-run` still works.
+`send --dry-run` still works. If a project becomes read-only after the server started (the `.slacker.json` now
+says `"readOnly": true`), the write tools stay listed but refuse with `read_only`:
+`Refusing to write: this project is now read-only ("readOnly": true in <file>).`
 
 ### Degraded mode
 
@@ -473,7 +606,7 @@ refreshed too.
 | `edit` | `edit_message` | `--ts`→`ts` |
 | `delete` | `delete_message` | `--ts`→`ts`. Only the CLI asks for confirmation. |
 | `react` | `add_reaction` | `--ts`→`ts` |
-| `init`, `auth …`, `serve` | none | CLI only |
+| `init`, `trust`, `auth …`, `serve` | none | CLI only |
 
 ## Safety model
 
@@ -487,18 +620,39 @@ refreshed too.
 - **Dry run has no side effects.** `send --dry-run` and `send_message` with `dry_run: true` validate the
   arguments, then resolve the destination, thread and team without posting. A dry run to a person looks them up
   but doesn't open a DM with them.
-- **No double posts.** A message post is never retried after an ambiguous failure. Errors say which case you're
-  in: "the message was NOT sent; try again later" (e.g. rate limited for more than about 10 seconds, or the
-  connection never opened) versus "the message may or may not have been posted; check the conversation before
-  retrying" (a timeout or reset mid-request). A delete that is retried and finds the message already gone counts
-  as done.
+- **No double posts.** A message post is never retried after an ambiguous failure. Errors from writes say
+  which case you're in. For a post: "the message was NOT sent; try again later" (rate limited for more than
+  about 10 seconds, or the connection never opened after the last retry: `ECONNREFUSED`, `EAI_AGAIN`,
+  `UND_ERR_CONNECT_TIMEOUT`) versus "the message may or may not have been posted; check the conversation before
+  retrying" (a timeout or reset mid-request, or Slack answering `fatal_error`, `internal_error`,
+  `request_timeout` or `service_unavailable`, which adds "Slack had an internal problem"). Edits, deletes,
+  reactions and status changes say "the change was NOT made; try again later" or "the change may or may not
+  have been made; check before retrying" in the same cases. A delete that is retried and finds the message
+  already gone counts as done.
 - **Untrusted content.** Message text is written by other people. The server instructions, each write tool's
   description, the prompts, and the `untrusted_content_notice` on read results all tell the model to treat it
   as data and to write only when you explicitly asked in the conversation.
+- **Project files are untrusted input.** A `.slacker.json` can restrict (`readOnly`) but only chooses the
+  workspace for writes once you've [trusted](#trusting-a-projects-slackerjson) it, and one owned by someone else
+  or writable by others is ignored (writes refused). Trust is checked on every write, in the CLI and the MCP
+  server. A bare `slacker init` refuses an untrusted file instead of trusting it. `slacker init` refuses to read
+  or rewrite a `.slacker.json` or `.mcp.json` that is a symlink leading outside the project (`unsafe_symlink`).
+- **`.mcp.json` isn't covered by trust.** A project's `.mcp.json` entry passes `--workspace` itself, so a repo
+  that ships one chooses the workspace its server writes to. Claude Code's approval prompt is the only gate:
+  read the `slacker` entry's `--workspace` and `command` before you approve it.
+- **Terminal output is sanitized.** Slack text is attacker-controlled: message text, user, display and real
+  names, channel names, topics and purposes, statuses, file names, search snippets and team names can contain
+  escape sequences that rewrite the screen, set the window title or write the clipboard (OSC 52). Human-readable
+  CLI output — results, the `delete` confirmation prompt, `init` and `auth` output, warnings and errors on
+  stderr, and the MCP server's stderr log — strips escape sequences, every control character except newline and
+  tab (including `\r`), and bidi override/isolate characters (U+202A–U+202E, U+2066–U+2069) before printing.
+  slacker's own colours are added afterwards. The dry-run echo of your own text shows these characters as
+  visible escapes instead. `--json` output isn't stripped, but DEL, C1 controls and bidi overrides/isolates are
+  written as `\uXXXX` escapes ([details](#--json)). MCP results are JSON and unchanged.
 - **Read-only mode is a guardrail, not a security boundary.** It hides tools and makes the CLI refuse writes.
   But an agent that can run shell commands could still run `slacker` from another directory, pass `-w`, edit
-  `.slacker.json`, or read `config.json` directly. If an agent must not be able to write, don't give it a shell
-  on a machine that holds your credentials.
+  `.slacker.json`, run `slacker trust`, or read `config.json` directly. If an agent must not be able to write,
+  don't give it a shell on a machine that holds your credentials.
 
 ## Limits and plan notes
 
@@ -529,11 +683,18 @@ refreshed too.
 | `Refusing to write: this project is read-only (…)` | The message names the reason (`.slacker.json` or `SLACKER_READ_ONLY`). Use `slacker init --no-read-only` or unset the variable. |
 | Warning that two names share a team, or `Refusing to write until config.json is fixed` (`workspace_alias`) | See [Fixing duplicated workspace entries](#fixing-duplicated-workspace-entries). In the CLI, `--allow-alias` writes anyway. |
 | `… has no teamId in config.json` (`team_unverified`) | Run `slacker auth setup` to re-import the workspace with its team. |
-| `… the message was NOT sent; try again later` | Nothing was posted. Retry later. |
-| `… the message may or may not have been posted` | Look at the conversation before retrying, or you may post twice. |
+| `… the message was NOT sent; try again later` / `the change was NOT made` | Nothing was posted or changed (rate limited, or the connection never opened). Retry later. |
+| `… the message may or may not have been posted` / `the change may or may not have been made` | The outcome is unknown (a timeout, or Slack's `fatal_error`, `internal_error`, `request_timeout`, `service_unavailable`). Look at the conversation before retrying, or you may post twice. |
 | `Workspace "x" is configured for team T… but its credentials sign in to …` | That config.json entry has the wrong credentials. Run `slacker auth remove x`, then `slacker auth setup`. Writes are refused until it's fixed. |
 | MCP tools all fail with `slacker is not configured: …` | That's [degraded mode](#degraded-mode). Follow the fix in the message: config.json fixes apply on the next call; a `.slacker.json` problem or changed server arguments need a reconnect with `/mcp`. Reconnect anyway once it works, so the agent's server instructions (sent only at startup) stop saying it's misconfigured. |
 | `Workspace "x" (from …) not found` | The part in parentheses says where `x` came from: fix that flag, `SLACKER_WORKSPACE`, `.slacker.json` (`slacker init <name>`), or `defaultWorkspace` (`slacker auth default <name>`). `slacker auth list` shows the names. |
+| `Refusing to write: …/.slacker.json picks workspace "x", but it isn't trusted on this machine` (`untrusted_project`) | Check that `x` is the right workspace for this project, then run `slacker trust` there (or `slacker init x`), or pass `-w <workspace>` for one command. A running MCP server picks up the trust on its next call. See [trust](#trusting-a-projects-slackerjson). |
+| `.slacker.json at … says workspace "x", but you haven't trusted it on this machine` (`untrusted_project`, from a bare `init`) | Check that `x` is right, then name it: `slacker init x` (add `--mcp` if you want it). |
+| `Refusing to write: this server started with workspace "x" …, but … now picks "y"` (`project_changed`) | The `.slacker.json` changed under a running server (or command). Restart the server (`/mcp` → reconnect), or run the command again. |
+| `Ignoring the trust file …` (`invalid_trust_file`) | Someone else owns your trust file or could change it, so nothing counts as trusted. Fix it as the message says (e.g. `chmod go-w`), or delete it and run `slacker trust` again in your projects. |
+| `slacker needs Node.js 22.12 or newer, but this is Node …` (`unsupported_node`) | Install a newer Node and run slacker with it. For Claude Code, re-run `init` with `--node <path>` if the entry uses an old Node. |
+| `Ignoring …/.slacker.json: it is owned by another user` / `is writable by …` / `is in …, which other users can write to` | Someone else controls that file (or its directory), so it's ignored and writes are refused. If it's yours: `chmod go-w` it (or `chown` it, or `chmod o-w` the directory); otherwise delete it or work from another directory. If it's yours and only group-writable, `-w` still works, with a warning. |
+| `… is a symlink to …, outside this project` (`unsafe_symlink`, from `init`) | Replace the symlinked `.slacker.json`/`.mcp.json` with a regular file (or remove it), then rerun `init`. |
 | `Invalid …/.slacker.json` / `Could not parse …/.slacker.json` | Fix or delete that file, or rerun `slacker init <workspace>` (with `--replace` to overwrite it). Read commands with `-w` and `auth` commands work meanwhile; writes are refused. |
 | MCP server missing in Claude Code | Approve it when asked, check `/mcp`, and make sure the `command` path still exists (nvm upgrades break it; use `init --node <path>`, see [init](#project-setup-slacker-init)). |
 | `ratelimited` | Slack is throttling your session. Wait a minute. |
@@ -552,7 +713,8 @@ npm pack --dry-run   # what would be published (README, LICENSE, package.json, d
 
 | File | Purpose |
 | --- | --- |
-| `src/index.ts` | Executable entry (`bin`); calls `main()` |
+| `src/index.ts` | Executable entry (`bin`); runs the Node version check, then loads the CLI and calls `main()` |
+| `src/node-check.ts` | Node.js 22.12+ check, with no imports so it runs on old Node |
 | `src/cli.ts` | Commander CLI: every command, `auth …`, `--json` errors |
 | `src/init.ts` | `slacker init`: `.slacker.json` / `.mcp.json`, the launch command (`--node`, `--command`, nvm detection) |
 | `src/server.ts` | MCP server: tools, instructions, read-only and degraded modes |
@@ -561,13 +723,20 @@ npm pack --dry-run   # what would be published (README, LICENSE, package.json, d
 | `src/resolve.ts` | Target resolution (links, channels, people), caches, page-capped directory scans |
 | `src/format.ts` | Turns Slack messages into compact objects (mentions, blocks, attachments, files) |
 | `src/api.ts` | Slack Web API client: timeouts, retries, rate limits, error hints |
-| `src/config.ts` | config.json load/save (atomic, `0600`), workspace choice, `.slacker.json`, desktop credential extraction |
+| `src/config.ts` | config.json load/save (atomic, `0600`), workspace choice, `.slacker.json` (ownership check, trust store, `slacker trust`), desktop credential extraction |
 | `src/auth.ts` | `auth setup / refresh / list / default / add / remove / rename` |
 | `src/command.ts` | The runnable `slacker` command shown in hints (with `-c` for a non-default config) |
 | `src/messages.ts` | Identity warnings and degraded-mode texts shared by the CLI and the MCP server |
 | `src/errors.ts` / `src/util.ts` | `SlackerError` (message + `code` + `hint`) and small shared helpers |
 | `src/limit.ts` | Small concurrency limiter |
-| `src/output.ts` | Terminal colours, tables, message printing |
+| `src/output.ts` | Terminal colours, tables, message printing, `sanitizeForTerminal` |
 | `src/version.ts` | Version from package.json |
 | `scripts/*.mjs` | Build helpers (clean `dist/`, make the entry executable) |
+| `.claude-plugin/marketplace.json` | Claude Code marketplace manifest; its one plugin's `source` is `./plugin` |
+| `plugin/.claude-plugin/plugin.json` | Plugin manifest. Its `version` must match `package.json` (a test checks it), so bump both |
+| `plugin/skills/slacker/` | The `slacker:slacker` skill (`SKILL.md` plus `references/`) |
+| `plugin/agents/slack-assistant.md` | The read-and-draft `slack-assistant` subagent |
 | `tests/helpers/slackStub.ts` | Fake Slack API (`installSlackStub`) and temp config files for tests |
+| `tests/helpers/setup.ts` | Runs before every test file: points `HOME`, `SLACKER_CONFIG`, `SLACKER_TRUST_FILE` and `PWD` at fresh temp paths and sets umask `022` |
+| `tests/meta.test.ts` | Checks that `package.json` and the plugin manifest have the same version, and the Node check |
+| `.github/workflows/ci.yml` | CI: typecheck, tests and `npm pack --dry-run` on Ubuntu and macOS, Node 22.12 and 24 |

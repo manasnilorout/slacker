@@ -186,6 +186,13 @@ export interface SlackSessionOptions {
   resolver?: Omit<ResolverOptions, "workspace">;
   /** How the workspace name was chosen, named in "workspace not found" errors. */
   source?: { source: WorkspaceSource; projectFile?: string };
+  /**
+   * Run before every write, dry runs included, before any network call: returns why the write must be
+   * refused — the workspace was chosen by a .slacker.json you haven't trusted, the nearest one is
+   * controlled by someone else, or it changed since the session started (`recheckWriteBlock`) — or
+   * undefined. Checked per write, so trusting a project takes effect without a restart. Reads are unaffected.
+   */
+  writeCheck?: () => SlackerError | undefined;
 }
 
 /** Pages users.list may fetch to fill one people listing. */
@@ -288,6 +295,12 @@ export class SlackSession {
     return id;
   }
 
+  /** Writes refuse a workspace chosen by an untrusted .slacker.json (see `writeCheck`). */
+  private assertProjectTrusted(): void {
+    const block = this.opts.writeCheck?.();
+    if (block) throw block;
+  }
+
   /** A link must belong to this workspace, or the API answers with an opaque channel_not_found. */
   private async checkLinkHost(link: SlackLink, { api, ws }: Client): Promise<void> {
     const cfgHost = hostOf(ws.url);
@@ -327,6 +340,7 @@ export class SlackSession {
    * still be called that by Slack (catches a stale directory after a rename).
    */
   private async writeTarget(spec: TargetSpec, { dryRun = false, allowAlias = false }: { dryRun?: boolean; allowAlias?: boolean }) {
+    this.assertProjectTrusted();
     const c = this.client();
     const id = await this.verifyWriteIdentity(c, allowAlias);
     const { resolver } = c;
@@ -579,7 +593,8 @@ export class SlackSession {
         return {
           id: c.id,
           name: d.name,
-          type: c.kind,
+          // counts.channels holds private channels too: describeConversation knows which (DMs keep their kind).
+          type: c.kind === "channel" ? d.type : c.kind,
           mentions: c.mention_count ?? 0,
           latest: tsToIso(c.latest),
           ...(d.archived && { archived: true as const }),
@@ -711,6 +726,7 @@ export class SlackSession {
     const bare = emoji.trim().replace(/^:+|:+$/g, "");
     const emojiName = bare ? `:${bare}:` : "";
 
+    this.assertProjectTrusted();
     const c = this.client();
     const id = await this.verifyWriteIdentity(c, allowAlias);
     const expiration = expiresInMinutes ? Math.floor(Date.now() / 1000) + expiresInMinutes * 60 : 0;

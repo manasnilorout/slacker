@@ -587,9 +587,9 @@ export class Resolver {
   /**
    * Resolve a target to a conversation ID. Accepts a conversation ID, a Slack link,
    * "#channel"/"channel" names (channels only — never people), or "@person" / user ID / email
-   * (opens a DM). `forWrite` is accepted for API symmetry; reads and writes resolve identically.
+   * (opens a DM). Reads and writes resolve identically.
    */
-  async resolveConversation(target: string, _opts: { forWrite?: boolean } = {}): Promise<string> {
+  async resolveConversation(target: string): Promise<string> {
     return this.resolveSpec(parseTarget(target));
   }
 

@@ -3,6 +3,7 @@
  * misconfiguration the same way (and always with a runnable fix command). Commands are written as
  * plain `slacker …`; `withRunNote` adds one line saying how to run slacker when that differs.
  */
+import { dirname } from "node:path";
 import { stripRunNote, withRunNote } from "./command.js";
 import { quoteNames } from "./util.js";
 
@@ -99,6 +100,52 @@ export function identityProblems(ws: { name: string; teamId?: string }, aliases:
   }
   if (!ws.teamId) problems.push({ code: "team_unverified", message: unverifiedWarning(ws.name, live), overridable: true });
   return problems;
+}
+
+// ── Untrusted .slacker.json ──────────────────────────────
+
+const PROJECT_FILE_NAME = ".slacker.json";
+
+/** Who reads a refusal: a person at the CLI, or an agent over MCP (which can't pass -w or run commands for the user). */
+export type Surface = "cli" | "mcp";
+
+/**
+ * Why a write is refused when an untrusted .slacker.json chose the workspace (`untrusted_project`).
+ * `why` is an optional parenthesised detail (" (you trusted it for …)"). Addressed to the person who
+ * must check the workspace; over MCP the agent is told to ask them, never to clear it itself.
+ */
+export function untrustedProjectRefusal(file: string, workspace: string, why: string, surface: Surface): string {
+  const lead = `Refusing to write: ${file} picks workspace "${workspace}", but it isn't trusted on this machine${why}.`;
+  if (surface === "mcp") {
+    return withRunNote(
+      `${lead} Ask the user to check it and run \`${cmd} trust\` in ${dirname(file)}. ` +
+        "This server rechecks trust on every write, so no reconnect is needed."
+    );
+  }
+  return withRunNote(
+    `${lead} If that workspace is right, run \`${cmd} trust\` in ${dirname(file)} (once). ` +
+      "To use a different workspace for one command, pass -w <name>."
+  );
+}
+
+/** Why a write is refused when the nearest .slacker.json is one someone else may control (`untrusted_project`; -w doesn't help). */
+export function foreignProjectRefusal(file: string, reason: string, fix: string | undefined, surface: Surface): string {
+  const lead = `Refusing to write: ${file} ${reason}, so slacker doesn't trust it — and it might say "readOnly": true.`;
+  const how = fix ?? "chmod go-w, or chown it";
+  return surface === "mcp"
+    ? `${lead} Ask the user to fix it (${how}) or remove it. This server rechecks it on every write, so no reconnect is needed.`
+    : `${lead} If it's yours, fix it (${how}), otherwise delete it or run slacker from another directory.`;
+}
+
+/**
+ * Bare `slacker init` (no workspace named) would take the workspace from a .slacker.json you haven't
+ * trusted, and trusting it is exactly what init would do next: refuse and ask for the name (`untrusted_project`).
+ */
+export function untrustedInitRefusal(file: string, workspace: string, detail: string, initArgs: string): string {
+  return withRunNote(
+    `${PROJECT_FILE_NAME} at ${file} says workspace "${workspace}", but you haven't trusted it on this machine${detail}. ` +
+      `Check that it's right, then name it explicitly: ${cmd} init ${workspace}${initArgs}. Nothing was written.`
+  );
 }
 
 // ── MCP degraded mode ────────────────────────────────────

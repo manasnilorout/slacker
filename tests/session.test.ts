@@ -645,6 +645,35 @@ describe("listUnread archived marker (R13)", () => {
   });
 });
 
+describe("listUnread conversation type (A-P2-9)", () => {
+  it("a private channel in counts.channels is reported as private_channel", async () => {
+    workspace().on("client.counts", () => ({
+      channels: [
+        { id: "C0GENERAL1", has_unreads: true, latest: "1700000000.000002" },
+        { id: "C0ENGENG01", has_unreads: true, latest: "1700000000.000001" },
+      ],
+      mpims: [{ id: "C0MPIM0001", has_unreads: true, latest: "1700000000.000000" }],
+    }));
+    const r = await session().listUnread({});
+    expect(r.conversations.map((c) => [c.id, c.type])).toEqual([
+      ["C0GENERAL1", "channel"],
+      ["C0ENGENG01", "private_channel"],
+      ["C0MPIM0001", "group_dm"], // info failed: the counts kind is kept
+    ]);
+  });
+});
+
+describe("addReaction: already_reacted counts as success (A-P2-13)", () => {
+  it("returns reacted: true when Slack says the reaction is already there", async () => {
+    const slack = workspace().on("reactions.add", () => slackError("already_reacted"));
+    const r = await session().addReaction({ target: LINK, emoji: ":eyes:" });
+    expect(r).toMatchObject({ reacted: true, ts: "1700000000.123456", emoji: "eyes", channel: "C0GENERAL1" });
+    expect(slack.count("reactions.add")).toBe(1);
+    slack.on("reactions.add", () => slackError("invalid_name"));
+    await expect(session().addReaction({ target: LINK, emoji: "nope" })).rejects.toMatchObject({ code: "invalid_name" });
+  });
+});
+
 describe("round 3 (F4, F12)", () => {
   it("alias refusals say 'all' when more than two names share a team", async () => {
     const three = writeTempConfig({ a: { teamId: "T0DUP0001" }, b: { teamId: "T0DUP0001" }, c: { teamId: "T0DUP0001" } }, "a");

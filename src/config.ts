@@ -1,10 +1,13 @@
 import {
   chmodSync,
   closeSync,
+  constants,
   existsSync,
   fchmodSync,
+  fstatSync,
   fsyncSync,
   linkSync,
+  lstatSync,
   mkdirSync,
   openSync,
   readdirSync,
@@ -16,12 +19,13 @@ import {
   writeSync,
 } from "node:fs";
 import { homedir, platform } from "node:os";
-import { dirname, isAbsolute, join, parse } from "node:path";
+import { basename, dirname, isAbsolute, join, parse } from "node:path";
 import { createDecipheriv, pbkdf2Sync, randomBytes } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { z } from "zod";
 import { withRunNote } from "./command.js";
 import { SlackerError } from "./errors.js";
+import { foreignProjectRefusal, RESTART, Surface, untrustedProjectRefusal } from "./messages.js";
 import { errorMessage, formatIssues, isPlainObject } from "./util.js";
 
 export interface WorkspaceConfig {
@@ -143,9 +147,10 @@ function replaceFile(target: string, data: string, mode: number): void {
 
 /**
  * Atomically replace `file` with `data` (readers never see a half-written file). An existing file
- * keeps its permission bits; a new one gets `mode`. Symlinks are written through.
+ * keeps its permission bits (minus `opts.clearBits`); a new one gets `mode`. Symlinks are written
+ * through — callers writing into a directory they don't control check the link first (see init).
  */
-export function writeFileAtomic(file: string, data: string, mode = 0o644): void {
+export function writeFileAtomic(file: string, data: string, mode = 0o644, opts: { clearBits?: number } = {}): void {
   const target = realTarget(file);
   let keep = mode;
   try {
@@ -153,7 +158,7 @@ export function writeFileAtomic(file: string, data: string, mode = 0o644): void 
   } catch {
     // new file
   }
-  replaceFile(target, data, keep);
+  replaceFile(target, data, keep & ~(opts.clearBits ?? 0));
 }
 
 /**
@@ -389,10 +394,11 @@ export const ProjectSettingsSchema = z.object({
   readOnly: z.boolean("must be true or false").optional(),
 });
 
-function readProjectSettings(file: string): ProjectSettings {
+/** Parse a .slacker.json's contents (`text`, already read from `file`). */
+function parseProjectSettings(text: string, file: string): ProjectSettings {
   let raw: unknown;
   try {
-    raw = JSON.parse(readFileSync(file, "utf-8"));
+    raw = JSON.parse(text);
   } catch (e) {
     throw new SlackerError(
       withRunNote(`Could not parse ${file}: ${errorMessage(e)}. Fix it or delete it, then run: slacker init.`),
@@ -426,8 +432,141 @@ function searchStarts(start: string): string[] {
   return [start];
 }
 
-/** Find the nearest .slacker.json walking up from `start`. */
-export function findProjectSettings(start = process.cwd()): { file: string; settings: ProjectSettings } | null {
+/** Open flags for checking a file before reading it: a FIFO planted as the file must not block the open. */
+const OPEN_FOR_CHECK = constants.O_RDONLY | (constants.O_NONBLOCK ?? 0);
+
+/** What `inspectOwnedFile` found. */
+export interface OwnedFileCheck {
+  /** Why another local user may control the file, or undefined when it's yours (see `foreignReason`). */
+  reason?: string;
+  /** How to fix it ("chmod go-w <file>" …), when `reason` is set. */
+  fix?: string;
+  /** You own the file and only its group may also write it (D6: usable for "readOnly" when -w names the workspace). */
+  groupWritableOnly?: boolean;
+  /** The contents, read from the same open file that was checked (with `read`, when it's yours or only group-writable). */
+  text?: string;
+}
+
+/** A directory other users may create or swap files in: writable by others without the sticky bit. */
+function openDirectory(dir: string): { reason: string; fix: string } | undefined {
+  let st;
+  try {
+    st = statSync(dir);
+  } catch {
+    return undefined;
+  }
+  if (!(st.mode & 0o002) || st.mode & 0o1000) return undefined;
+  return {
+    reason: `is in ${dir}, which other users can write to (mode ${(st.mode & 0o7777).toString(8)}, no sticky bit)`,
+    fix: `chmod o-w ${dir}, or move the project`,
+  };
+}
+
+/**
+ * Check who controls `file` and (with `read`) read it, all through one open file descriptor, so the
+ * file can't be swapped between the check and the read. It (and a symlink to it) must be owned by
+ * you, be a regular file, not be writable by group or others, and not sit in a directory others can
+ * write to (without the sticky bit) — otherwise another local user (e.g. in a shared /tmp) could have
+ * planted it or could change it. Ownership and modes aren't checked on Windows.
+ */
+export function inspectOwnedFile(file: string, read = false): OwnedFileCheck {
+  const uid = process.getuid?.();
+  const posix = platform() !== "win32" && uid !== undefined;
+  if (posix) {
+    // Before opening anything: a symlink someone else planted may point at a device.
+    try {
+      const link = lstatSync(file);
+      if (link.isSymbolicLink() && link.uid !== uid) return { reason: `is a symlink owned by another user (uid ${link.uid})`, fix: "chown it" };
+    } catch (e) {
+      return { reason: `can't be read (${errorMessage(e)})`, fix: "make it readable" };
+    }
+  }
+  let fd: number;
+  try {
+    fd = openSync(file, OPEN_FOR_CHECK);
+  } catch (e) {
+    return { reason: `can't be read (${errorMessage(e)})`, fix: "make it readable" };
+  }
+  try {
+    const st = fstatSync(fd);
+    if (!st.isFile()) return { reason: "is not a regular file", fix: "replace it with a regular file" };
+    const contents = () => (read ? { text: readFileSync(fd, "utf-8") } : {});
+    if (!posix) return contents();
+    if (st.uid !== uid) return { reason: `is owned by another user (uid ${st.uid})`, fix: "chown it" };
+    for (const dir of new Set([dirname(file), dirname(realLocation(file))])) {
+      const open = openDirectory(dir);
+      if (open) return open;
+    }
+    if (st.mode & 0o022) {
+      const groupOnly = !(st.mode & 0o002);
+      const who = groupOnly ? "its group" : st.mode & 0o020 ? "group and others" : "others";
+      return {
+        reason: `is writable by ${who} (mode ${(st.mode & 0o777).toString(8)})`,
+        fix: `chmod go-w ${file}`,
+        ...(groupOnly && { groupWritableOnly: true, ...contents() }),
+      };
+    }
+    return contents();
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/** Why a file can't be trusted because of who controls it, or undefined when it's yours (see `inspectOwnedFile`). */
+export function foreignReason(file: string): string | undefined {
+  return inspectOwnedFile(file).reason;
+}
+
+/**
+ * The key trust records use for a file: its directory's canonical realpath (`realpathSync.native`,
+ * which also fixes the case on case-insensitive file systems) joined with its own name. The file
+ * itself is not followed: a .slacker.json that is a symlink to another project's trusted file is a
+ * different key, so it can't borrow that project's trust (a cloned repo can contain such a link).
+ */
+export function trustKey(file: string): string {
+  try {
+    if (!lstatSync(file).isSymbolicLink()) return realpathSync.native(file);
+  } catch {
+    // missing: key it by its directory
+  }
+  try {
+    return join(realpathSync.native(dirname(file)), basename(file));
+  } catch {
+    return file;
+  }
+}
+
+/** Where `file` really lives (following symlinks), or `file` itself when that can't be resolved. */
+function realLocation(file: string): string {
+  try {
+    return realpathSync.native(file);
+  } catch {
+    return file;
+  }
+}
+
+export interface ProjectLookup {
+  /** The path where it was found. */
+  file: string;
+  /** The key trust records use for it (its directory's realpath + its name: `trustKey`). */
+  realFile: string;
+  /** Empty when `foreign` is set (a foreign file isn't parsed). */
+  settings: ProjectSettings;
+  /** Set when ownership/permissions make the file untrusted: why (see `inspectOwnedFile`). */
+  foreign?: string;
+  /** How to fix `foreign`. */
+  fix?: string;
+  /** `foreign` only because its group may write it (you own it): `parse` reads the settings anyway. */
+  groupWritableOnly?: boolean;
+  /** With `groupWritableOnly`: parse the contents read when it was checked (may throw invalid_project_file). */
+  parse?: () => ProjectSettings;
+}
+
+/**
+ * Find the nearest .slacker.json walking up from `start`. A file someone else controls (`foreign`) is
+ * returned unparsed: callers ignore it for reads and refuse writes.
+ */
+export function findProjectSettings(start = process.cwd()): ProjectLookup | null {
   const seen = new Set<string>();
   for (const from of searchStarts(start)) {
     let dir = from;
@@ -435,12 +574,130 @@ export function findProjectSettings(start = process.cwd()): { file: string; sett
     while (!seen.has(dir)) {
       seen.add(dir);
       const file = join(dir, PROJECT_FILE);
-      if (existsSync(file)) return { file, settings: readProjectSettings(file) };
+      if (existsSync(file)) {
+        const realFile = trustKey(file);
+        const check = inspectOwnedFile(file, true);
+        if (check.reason) {
+          const { text = "" } = check;
+          return {
+            file,
+            realFile,
+            settings: {},
+            foreign: check.reason,
+            ...(check.fix && { fix: check.fix }),
+            ...(check.groupWritableOnly && { groupWritableOnly: true, parse: () => parseProjectSettings(text, file) }),
+          };
+        }
+        return { file, realFile, settings: parseProjectSettings(check.text ?? "", file) };
+      }
       if (dir === root) break;
       dir = dirname(dir);
     }
   }
   return null;
+}
+
+// ── Project trust ────────────────────────────────────────
+// A .slacker.json may always restrict ("readOnly": true), but it only chooses the workspace for
+// writes once you've trusted it on this machine (`slacker trust`, or `slacker init` writing it).
+
+/** Where trust records live: SLACKER_TRUST_FILE, else ~/.config/slacker/trusted-projects.json. */
+export function trustFilePath(): string {
+  return process.env.SLACKER_TRUST_FILE || join(homedir(), ".config", "slacker", "trusted-projects.json");
+}
+
+export interface TrustRecord {
+  workspace: string;
+  trustedAt: string;
+}
+
+export interface TrustStore {
+  version: 1;
+  /** Project file realpath → the workspace it was trusted for. */
+  projects: Record<string, TrustRecord>;
+  [key: string]: unknown;
+}
+
+/**
+ * The trust store (empty when the file doesn't exist). A corrupt one, or one someone else could have
+ * written (same ownership/mode checks as a .slacker.json), is an error (`invalid_trust_file`): callers
+ * then treat every project file as untrusted.
+ */
+export function loadTrust(file = trustFilePath()): TrustStore {
+  if (!existsSync(file)) return { version: 1, projects: {} };
+  const check = inspectOwnedFile(file, true);
+  if (check.reason) {
+    throw new SlackerError(
+      `Ignoring the trust file ${file}: it ${check.reason}, so someone else could have added trust records. ` +
+        `Until it's fixed, no ${PROJECT_FILE} counts as trusted. Fix it (${check.fix ?? `chmod 600 ${file}`}), ` +
+        "or delete it and run slacker trust again in your projects.",
+      "invalid_trust_file"
+    );
+  }
+  const bad = (why: string) =>
+    new SlackerError(`Invalid trust file ${file}: ${why}. Fix it or delete it (then re-run slacker trust in your projects).`, "invalid_trust_file");
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(check.text ?? "");
+  } catch (e) {
+    throw bad(errorMessage(e));
+  }
+  if (!isPlainObject(parsed)) throw bad("expected a JSON object");
+  const projects = parsed.projects ?? {};
+  if (!isPlainObject(projects)) throw bad(`"projects" must be an object`);
+  const clean: Record<string, TrustRecord> = {};
+  for (const [path, rec] of Object.entries(projects)) {
+    if (isPlainObject(rec) && typeof rec.workspace === "string") {
+      clean[path] = { workspace: rec.workspace, trustedAt: typeof rec.trustedAt === "string" ? rec.trustedAt : "" };
+    }
+  }
+  return { ...parsed, version: 1, projects: clean };
+}
+
+/** The workspace `realFile` is trusted for, if any. */
+export function trustedWorkspace(realFile: string, file = trustFilePath()): string | undefined {
+  const store = loadTrust(file);
+  return Object.hasOwn(store.projects, realFile) ? store.projects[realFile].workspace : undefined;
+}
+
+/** Locked read-modify-write of the trust store (0600 in a 0700 directory). */
+export function updateTrust<R>(mutate: (store: TrustStore) => R, file = trustFilePath()): R {
+  const target = realTarget(file);
+  const dir = dirname(target);
+  if (!existsSync(dir)) {
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    chmodSync(dir, 0o700);
+  }
+  const lock = `${target}.lock`;
+  const token = acquireLock(lock, file, {});
+  try {
+    const store = loadTrust(file);
+    const before = JSON.stringify(store);
+    const result = mutate(store);
+    if (JSON.stringify(store) !== before) replaceFile(target, JSON.stringify(store, null, 2) + "\n", 0o600);
+    return result;
+  } finally {
+    releaseLock(lock, token);
+  }
+}
+
+/** Trust `realFile` to choose `workspace`. Returns the workspace it was trusted for before, if any. */
+export function recordTrust(realFile: string, workspace: string, file = trustFilePath()): string | undefined {
+  return updateTrust((store) => {
+    const previous = Object.hasOwn(store.projects, realFile) ? store.projects[realFile].workspace : undefined;
+    if (previous !== workspace) store.projects[realFile] = { workspace, trustedAt: new Date().toISOString() };
+    return previous;
+  }, file);
+}
+
+/** Forget `realFile`. Returns the workspace it was trusted for, or undefined when it wasn't. */
+export function removeTrust(realFile: string, file = trustFilePath()): string | undefined {
+  return updateTrust((store) => {
+    if (!Object.hasOwn(store.projects, realFile)) return undefined;
+    const previous = store.projects[realFile].workspace;
+    delete store.projects[realFile];
+    return previous;
+  }, file);
 }
 
 /**
@@ -463,6 +720,25 @@ export interface WorkspaceChoice {
   readOnly: boolean;
   /** Set when an invalid .slacker.json was skipped (`ignoreInvalidProject`): why it was. */
   ignoredProjectError?: string;
+  /**
+   * When `projectFile` names a workspace: whether you trusted that file for that workspace
+   * (`slacker trust` / `slacker init`). Only a trusted file may choose the workspace for writes.
+   */
+  projectTrusted?: boolean;
+  /** The workspace the trust record has for `projectFile`, when it differs from the file's (or is missing: undefined). */
+  trustedFor?: string;
+  /** Why the trust record couldn't be read (a corrupt trust file counts as untrusted). */
+  trustError?: string;
+  /**
+   * The nearest .slacker.json was ignored because someone else controls it (owner/permissions):
+   * reads fall through to the next source; writes are refused, since it might say read-only.
+   */
+  foreignProject?: { file: string; reason: string; fix?: string };
+  /**
+   * D6: the nearest .slacker.json is yours but writable by its group, and -w / SLACKER_WORKSPACE named
+   * the workspace, so the file only contributes "readOnly" (writes aren't blocked; a warning is shown).
+   */
+  groupWritableProject?: { file: string; reason: string };
 }
 
 /**
@@ -470,25 +746,233 @@ export interface WorkspaceChoice {
  * --workspace flag > SLACKER_WORKSPACE env > nearest .slacker.json > defaultWorkspace.
  * An invalid .slacker.json throws (`invalid_project_file`) — it may say `"readOnly": true` —
  * unless `ignoreInvalidProject` is set (callers that never write), which skips it and reports why.
+ * A .slacker.json someone else controls is ignored (`foreignProject`); whether the one used is
+ * trusted is reported in `projectTrusted` (see `projectWriteBlock`).
  */
 export function chooseWorkspace(flag?: string, cwd = process.cwd(), opts: { ignoreInvalidProject?: boolean } = {}): WorkspaceChoice {
-  let project: ReturnType<typeof findProjectSettings> = null;
-  let ignoredProjectError: string | undefined;
-  try {
-    project = findProjectSettings(cwd);
-  } catch (e) {
-    if (!(opts.ignoreInvalidProject && e instanceof SlackerError && e.code === "invalid_project_file")) throw e;
-    ignoredProjectError = e.message;
-  }
-  const ignored = ignoredProjectError === undefined ? {} : { ignoredProjectError };
-  const readOnly = project?.settings.readOnly === true || parseBoolEnv(process.env.SLACKER_READ_ONLY);
-  const base = { projectFile: project?.file, readOnly, ...ignored };
   const env = process.env.SLACKER_WORKSPACE?.trim();
   const flagName = flag?.trim();
+  let found: ProjectLookup | null = null;
+  let ignoredProjectError: string | undefined;
+  const skipInvalid = (e: unknown) => {
+    if (!(opts.ignoreInvalidProject && e instanceof SlackerError && e.code === "invalid_project_file")) throw e;
+    ignoredProjectError = e.message;
+  };
+  try {
+    found = findProjectSettings(cwd);
+  } catch (e) {
+    skipInvalid(e);
+  }
+  let foreignProject: WorkspaceChoice["foreignProject"] = found?.foreign ? { file: found.file, reason: found.foreign, ...(found.fix && { fix: found.fix }) } : undefined;
+  let project = foreignProject ? null : found;
+  let groupWritableProject: WorkspaceChoice["groupWritableProject"];
+  if (found?.foreign && found.groupWritableOnly && found.parse && (flagName || env)) {
+    // Yours, only group-writable, and the workspace is named elsewhere: honour its "readOnly" (fail closed) and warn.
+    foreignProject = undefined;
+    groupWritableProject = { file: found.file, reason: found.foreign };
+    try {
+      project = { ...found, settings: found.parse() };
+    } catch (e) {
+      skipInvalid(e);
+    }
+  }
+  const readOnly = project?.settings.readOnly === true || parseBoolEnv(process.env.SLACKER_READ_ONLY);
+
+  let trust: Pick<WorkspaceChoice, "projectTrusted" | "trustedFor" | "trustError"> = {};
+  const projectWorkspace = groupWritableProject ? undefined : project?.settings.workspace;
+  if (project && projectWorkspace) {
+    try {
+      const recorded = trustedWorkspace(project.realFile);
+      trust = { projectTrusted: recorded === projectWorkspace, ...(recorded !== undefined && recorded !== projectWorkspace && { trustedFor: recorded }) };
+    } catch (e) {
+      trust = { projectTrusted: false, trustError: errorMessage(e) };
+    }
+  }
+
+  const base = {
+    projectFile: project?.file,
+    readOnly,
+    ...(ignoredProjectError !== undefined && { ignoredProjectError }),
+    ...trust,
+    ...(foreignProject && { foreignProject }),
+    ...(groupWritableProject && { groupWritableProject }),
+  };
   if (flagName) return { ...base, name: flagName, source: "flag" };
   if (env) return { ...base, name: env, source: "env" };
-  if (project?.settings.workspace) return { ...base, name: project.settings.workspace, source: "project" };
+  if (projectWorkspace) return { ...base, name: projectWorkspace, source: "project" };
   return { ...base, source: "default" };
+}
+
+/**
+ * Why writes must be refused because of an untrusted .slacker.json (code `untrusted_project`), or
+ * undefined. Refused when the nearest .slacker.json is controlled by someone else (it might say
+ * read-only; -w doesn't help), or when the workspace was chosen by a .slacker.json you haven't
+ * trusted for that workspace (-w or SLACKER_WORKSPACE bypass the file's choice). `surface` picks the
+ * advice: a person at the CLI, or an agent over MCP (no -w, ask the user).
+ */
+export function projectWriteBlock(choice: WorkspaceChoice, surface: Surface = "cli"): SlackerError | undefined {
+  const f = choice.foreignProject;
+  if (f) return new SlackerError(foreignProjectRefusal(f.file, f.reason, f.fix, surface), "untrusted_project", `fix or remove ${f.file}`);
+  if (choice.source !== "project" || choice.projectTrusted) return undefined;
+  const file = choice.projectFile ?? PROJECT_FILE;
+  const why = choice.trustError
+    ? ` (the trust record couldn't be read: ${choice.trustError})`
+    : choice.trustedFor !== undefined
+      ? ` (you trusted it for workspace "${choice.trustedFor}", but it now says "${choice.name}")`
+      : "";
+  return new SlackerError(
+    untrustedProjectRefusal(file, choice.name ?? "", why, surface),
+    "untrusted_project",
+    withRunNote(`check that "${choice.name}" is right, then run slacker trust in ${dirname(file)}`)
+  );
+}
+
+/**
+ * D3: the project-file check, run again right before a write (the CLI's one write, or every MCP write
+ * call): `start` is the choice the session was set up with. Refuses (fails closed) when the project
+ * file is now invalid, untrusted or someone else's, when it now picks another workspace than the
+ * session uses (`project_changed`), or when it now says read-only. So `slacker trust` and
+ * `trust --remove` take effect on the next write, without reconnecting an MCP server.
+ */
+export function recheckWriteBlock(start: WorkspaceChoice, o: { cwd: string; flag?: string; surface?: Surface }): SlackerError | undefined {
+  let now: WorkspaceChoice;
+  try {
+    now = chooseWorkspace(o.flag, o.cwd);
+  } catch (e) {
+    return e instanceof SlackerError ? e : new SlackerError(errorMessage(e), "invalid_project_file");
+  }
+  const block = projectWriteBlock(now, o.surface);
+  if (block) return block;
+  if ((start.source === "project" || now.source === "project") && (now.source !== start.source || now.name !== start.name)) {
+    const was = start.name ? `workspace "${start.name}" (${describeSource(start)})` : "the default workspace";
+    const is = now.source === "project" ? `${now.projectFile ?? PROJECT_FILE} now picks "${now.name}"` : `no ${PROJECT_FILE} picks it any more`;
+    const fix = o.surface === "mcp" ? `Ask the user to ${RESTART}` : "Run the command again";
+    return new SlackerError(`Refusing to write: this ${o.surface === "mcp" ? "server" : "command"} started with ${was}, but ${is}. ${fix} to pick up the change.`, "project_changed");
+  }
+  if (now.readOnly && !start.readOnly) {
+    const why = now.projectFile && !parseBoolEnv(process.env.SLACKER_READ_ONLY) ? `"readOnly": true in ${now.projectFile}` : "SLACKER_READ_ONLY is set";
+    return new SlackerError(`Refusing to write: this project is now read-only (${why}).`, "read_only");
+  }
+  return undefined;
+}
+
+/** D6: the warning for a group-writable .slacker.json used only for "readOnly" (shown for reads and writes). */
+export function projectWriteWarnings(choice: WorkspaceChoice): string[] {
+  const g = choice.groupWritableProject;
+  if (!g) return [];
+  const by = choice.source === "env" ? "SLACKER_WORKSPACE" : "-w";
+  return [
+    `${g.file} ${g.reason}, so only its "readOnly" is used (${by} picks the workspace); without ${by} it's ignored and writes are refused. Fix: chmod g-w ${g.file}`,
+  ];
+}
+
+/** One-line stderr warnings for reads that use or skip an untrusted .slacker.json (empty when there's nothing to say). */
+export function projectReadWarnings(choice: WorkspaceChoice): string[] {
+  const out: string[] = projectWriteWarnings(choice);
+  const f = choice.foreignProject;
+  if (f) out.push(`Ignoring ${f.file}: it ${f.reason}. Writes are refused while it's there.`);
+  if (choice.source === "project" && !choice.projectTrusted) {
+    out.push(`Using workspace "${choice.name}" from untrusted ${choice.projectFile ?? PROJECT_FILE}; run slacker trust to silence`);
+  }
+  return out;
+}
+
+export interface TrustResult {
+  action: "trusted" | "already_trusted" | "removed" | "not_trusted";
+  file: string;
+  /** The path trust is recorded under (the file's realpath). */
+  realFile: string;
+  /** The workspace now trusted (trust) or that was trusted (remove). */
+  workspace: string | null;
+  /** The workspace it was trusted for before, when that changed. */
+  previous: string | null;
+  trustFile: string;
+}
+
+function nearestProject(cwd: string): ProjectLookup {
+  const found = findProjectSettings(cwd);
+  if (!found) {
+    throw new SlackerError(`No ${PROJECT_FILE} found in ${cwd} or any directory above it. Create one with: slacker init <workspace>`, "no_project_file");
+  }
+  return found;
+}
+
+/**
+ * `slacker trust`: allow the nearest .slacker.json, as it is now, to choose the workspace for writes.
+ * Refused for a file someone else controls; the workspace must exist in config.json.
+ */
+export function trustProject(cwd: string, configFile = configPath()): TrustResult {
+  const found = nearestProject(cwd);
+  if (found.foreign) {
+    throw new SlackerError(
+      `Won't trust ${found.file}: it ${found.foreign}. If it's yours, fix it (${found.fix ?? "chmod go-w, or chown it"}) and run slacker trust again.`,
+      "untrusted_project"
+    );
+  }
+  const workspace = found.settings.workspace;
+  if (!workspace) {
+    throw new SlackerError(`${found.file} doesn't choose a workspace, so there is nothing to trust (its "readOnly" applies either way).`, "invalid_project_file");
+  }
+  resolveWorkspace(workspace, configFile, { source: "project", projectFile: found.file });
+  const previous = recordTrust(found.realFile, workspace);
+  return {
+    action: previous === workspace ? "already_trusted" : "trusted",
+    file: found.file,
+    realFile: found.realFile,
+    workspace,
+    previous: previous !== undefined && previous !== workspace ? previous : null,
+    trustFile: trustFilePath(),
+  };
+}
+
+/** `slacker trust --remove [file]`: forget the nearest .slacker.json (or `file`, which may no longer exist). */
+export function untrustProject(cwd: string, file?: string): TrustResult {
+  let path: string;
+  let realFile: string;
+  if (file) {
+    path = isAbsolute(file) ? file : join(cwd, file);
+    realFile = trustKey(path);
+  } else {
+    ({ file: path, realFile } = nearestProject(cwd));
+  }
+  const previous = removeTrust(realFile);
+  return {
+    action: previous === undefined ? "not_trusted" : "removed",
+    file: path,
+    realFile,
+    workspace: previous ?? null,
+    previous: null,
+    trustFile: trustFilePath(),
+  };
+}
+
+/** `slacker trust --list`: every trusted project file, and whether it still names the trusted workspace. */
+/** ok: still names the trusted workspace; changed: names another one (writes refused); foreign: someone else may control it now. */
+export type TrustStatus = "ok" | "changed" | "missing" | "invalid" | "foreign";
+
+export interface TrustListEntry {
+  file: string;
+  workspace: string;
+  trustedAt: string;
+  status: TrustStatus;
+  /** For foreign / invalid: why (e.g. "is writable by its group (mode 664)"). */
+  reason?: string;
+}
+
+export function listTrust(): { trustFile: string; projects: TrustListEntry[] } {
+  const store = loadTrust();
+  const projects = Object.entries(store.projects).map(([file, rec]): TrustListEntry => {
+    const entry = { file, workspace: rec.workspace, trustedAt: rec.trustedAt };
+    if (!existsSync(file)) return { ...entry, status: "missing" };
+    const check = inspectOwnedFile(file, true);
+    if (check.reason) return { ...entry, status: "foreign", reason: check.reason };
+    try {
+      return { ...entry, status: parseProjectSettings(check.text ?? "", file).workspace === rec.workspace ? "ok" : "changed" };
+    } catch (e) {
+      return { ...entry, status: "invalid", reason: errorMessage(e) };
+    }
+  });
+  return { trustFile: trustFilePath(), projects };
 }
 
 // ── Credential extraction from the Slack desktop app ─────

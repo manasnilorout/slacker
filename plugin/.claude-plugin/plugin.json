@@ -1,0 +1,11 @@
+{
+  "name": "slacker",
+  "version": "0.1.0",
+  "description": "Read, search and send Slack messages as yourself through the slacker CLI or its MCP server, with one workspace per project",
+  "author": {
+    "name": "Manas Nilorout"
+  },
+  "repository": "https://github.com/manasnilorout/slacker",
+  "license": "MIT",
+  "keywords": ["slack", "messaging", "mcp", "search", "unread"]
+}

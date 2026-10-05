@@ -7,6 +7,7 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -16,6 +17,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { execFileSync } from "node:child_process";
 
 // Pass-through fs whose fsync can be made to fail, to check that no temp file is left behind.
 const fsState = vi.hoisted(() => ({ failFsync: false }));
@@ -35,7 +37,20 @@ import {
   chooseWorkspace,
   DEFAULT_CONFIG_FILE,
   findDuplicateTeams,
+  findProjectSettings,
+  foreignReason,
+  inspectOwnedFile,
   loadConfig,
+  projectReadWarnings,
+  projectWriteWarnings,
+  recheckWriteBlock,
+  trustKey,
+  loadTrust,
+  projectWriteBlock,
+  recordTrust,
+  removeTrust,
+  trustFilePath,
+  trustedWorkspace,
   parseBoolEnv,
   removeStaleLock,
   resolveWorkspace,
@@ -445,5 +460,251 @@ describe("chooseWorkspace with an invalid .slacker.json (F5)", () => {
     const c = chooseWorkspace("work", dir, { ignoreInvalidProject: true });
     expect(c).toMatchObject({ name: "work", source: "flag", readOnly: false });
     expect(c.ignoredProjectError).toMatch(/Invalid .*\.slacker\.json: "readOnly" must be true or false/);
+  });
+});
+
+describe("project trust store", () => {
+  const savedEnv = { ...process.env };
+  afterEach(() => {
+    process.env = { ...savedEnv };
+  });
+
+  it("defaults to ~/.config/slacker/trusted-projects.json via os.homedir() (HOME), overridable with SLACKER_TRUST_FILE", () => {
+    const home = join(root, `home${++n}`);
+    process.env.HOME = home;
+    delete process.env.SLACKER_TRUST_FILE;
+    expect(trustFilePath()).toBe(join(home, ".config", "slacker", "trusted-projects.json"));
+    process.env.SLACKER_TRUST_FILE = "/elsewhere/t.json";
+    expect(trustFilePath()).toBe("/elsewhere/t.json");
+  });
+
+  it("records, replaces and removes trust; dir 0700, file 0600, no temp or lock files left", () => {
+    const dir = join(root, `trust${++n}`, "slacker");
+    const file = join(dir, "trusted-projects.json");
+    expect(recordTrust("/p/.slacker.json", "acme", file)).toBeUndefined();
+    expect(mode(dir)).toBe(0o700);
+    expect(mode(file)).toBe(0o600);
+    expect(trustedWorkspace("/p/.slacker.json", file)).toBe("acme");
+    expect(recordTrust("/p/.slacker.json", "side", file)).toBe("acme");
+    expect(loadTrust(file).projects["/p/.slacker.json"]).toMatchObject({ workspace: "side", trustedAt: expect.stringMatching(/^\d{4}-/) });
+    expect(removeTrust("/p/.slacker.json", file)).toBe("side");
+    expect(removeTrust("/p/.slacker.json", file)).toBeUndefined();
+    expect(trustedWorkspace("/p/.slacker.json", file)).toBeUndefined();
+    expect(readdirSync(dir)).toEqual(["trusted-projects.json"]);
+  });
+
+  it("a corrupt trust file is an error (invalid_trust_file), never silently replaced", () => {
+    const file = join(root, `trust${++n}.json`);
+    writeFileSync(file, "{oops");
+    expect(() => trustedWorkspace("/p", file)).toThrow(expect.objectContaining({ code: "invalid_trust_file" }));
+    expect(() => recordTrust("/p", "w", file)).toThrow(expect.objectContaining({ code: "invalid_trust_file" }));
+    expect(readFileSync(file, "utf-8")).toBe("{oops");
+  });
+});
+
+describe("chooseWorkspace and project trust", () => {
+  const savedEnv = { ...process.env };
+  afterEach(() => {
+    process.env = { ...savedEnv };
+  });
+
+  function project(settings: unknown, fileMode = 0o644) {
+    const dir = mkdtempSync(join(root, "trust-proj-"));
+    const file = join(dir, ".slacker.json");
+    writeFileSync(file, JSON.stringify(settings));
+    chmodSync(file, fileMode);
+    process.env.SLACKER_TRUST_FILE = join(dir, "trust.json");
+    return { dir, file, real: realpathSync(file) };
+  }
+
+  it("an untrusted file chooses the workspace for reads but writes are blocked; trusting it lifts the block", () => {
+    const p = project({ workspace: "acme" });
+    let c = chooseWorkspace(undefined, p.dir);
+    expect(c).toMatchObject({ name: "acme", source: "project", projectTrusted: false });
+    expect(projectWriteBlock(c)).toMatchObject({ code: "untrusted_project" });
+    recordTrust(p.real, "acme");
+    c = chooseWorkspace(undefined, p.dir);
+    expect(c.projectTrusted).toBe(true);
+    expect(projectWriteBlock(c)).toBeUndefined();
+  });
+
+  it("trust is for one workspace: a changed file is untrusted again, naming both", () => {
+    const p = project({ workspace: "acme" });
+    recordTrust(p.real, "other");
+    const c = chooseWorkspace(undefined, p.dir);
+    expect(c).toMatchObject({ projectTrusted: false, trustedFor: "other" });
+    expect(projectWriteBlock(c)?.message).toContain('(you trusted it for workspace "other", but it now says "acme")');
+  });
+
+  it("-w / SLACKER_WORKSPACE bypass the file's choice (no block), but readOnly still applies", () => {
+    const p = project({ workspace: "acme", readOnly: true });
+    expect(projectWriteBlock(chooseWorkspace("side", p.dir))).toBeUndefined();
+    expect(chooseWorkspace("side", p.dir)).toMatchObject({ source: "flag", readOnly: true, projectTrusted: false });
+    process.env.SLACKER_WORKSPACE = "side";
+    expect(projectWriteBlock(chooseWorkspace(undefined, p.dir))).toBeUndefined();
+  });
+
+  it("a file without a workspace needs no trust", () => {
+    const p = project({ readOnly: true });
+    const c = chooseWorkspace(undefined, p.dir);
+    expect(c).toMatchObject({ source: "default", readOnly: true });
+    expect(c.projectTrusted).toBeUndefined();
+    expect(projectWriteBlock(c)).toBeUndefined();
+  });
+
+  it.each([0o646, 0o662, 0o666])("mode %s (writable by others): ignored, unparsed, writes blocked even with -w", (fileMode) => {
+    const p = project({ workspace: "acme", readOnly: true }, fileMode);
+    expect(foreignReason(p.file)).toMatch(/^is writable by/);
+    expect(findProjectSettings(p.dir)).toMatchObject({ file: p.file, settings: {}, foreign: expect.stringMatching(/writable/) });
+    recordTrust(p.real, "acme"); // trust doesn't help while others can change it
+    const c = chooseWorkspace("side", p.dir);
+    expect(c).toMatchObject({ source: "flag", readOnly: false, foreignProject: { file: p.file } });
+    expect(c.projectFile).toBeUndefined();
+    expect(projectWriteBlock(c)).toMatchObject({ code: "untrusted_project", message: expect.stringContaining("might say \"readOnly\": true") });
+    expect(chooseWorkspace(undefined, p.dir).source).toBe("default");
+  });
+
+  it("D6: your own file that only its group can write: ignored without -w; with -w/env it only adds readOnly, with a warning", () => {
+    const p = project({ workspace: "acme", readOnly: true }, 0o664);
+    const without = chooseWorkspace(undefined, p.dir);
+    expect(without).toMatchObject({ source: "default", readOnly: false, foreignProject: { file: p.file, reason: "is writable by its group (mode 664)", fix: `chmod go-w ${p.file}` } });
+    expect(projectWriteBlock(without)).toMatchObject({ code: "untrusted_project" });
+    const named = chooseWorkspace("side", p.dir);
+    expect(named).toMatchObject({ source: "flag", name: "side", readOnly: true, projectFile: p.file, groupWritableProject: { file: p.file } });
+    expect(named.foreignProject).toBeUndefined();
+    expect(named.projectTrusted).toBeUndefined();
+    expect(projectWriteBlock(named)).toBeUndefined();
+    expect(projectWriteWarnings(named)).toEqual([
+      `${p.file} is writable by its group (mode 664), so only its "readOnly" is used (-w picks the workspace); without -w it's ignored and writes are refused. Fix: chmod g-w ${p.file}`,
+    ]);
+    expect(projectReadWarnings(named)).toEqual(projectWriteWarnings(named));
+    process.env.SLACKER_WORKSPACE = "side";
+    expect(projectWriteWarnings(chooseWorkspace(undefined, p.dir))[0]).toContain("(SLACKER_WORKSPACE picks the workspace)");
+    // An invalid group-writable file fails closed like any other invalid file once it's used.
+    writeFileSync(p.file, '{"readOnly": "yes"}');
+    chmodSync(p.file, 0o664);
+    expect(() => chooseWorkspace("side", p.dir)).toThrow(expect.objectContaining({ code: "invalid_project_file" }));
+    expect(chooseWorkspace("side", p.dir, { ignoreInvalidProject: true }).ignoredProjectError).toMatch(/must be true or false/);
+  });
+
+  it("B-P2-4: a directory others can write to (without the sticky bit) makes its .slacker.json foreign", () => {
+    const p = project({ workspace: "acme" });
+    recordTrust(p.real, "acme");
+    chmodSync(p.dir, 0o777);
+    try {
+      expect(foreignReason(p.file)).toBe(`is in ${p.dir}, which other users can write to (mode 777, no sticky bit)`);
+      expect(projectWriteBlock(chooseWorkspace("acme", p.dir))).toMatchObject({ code: "untrusted_project" });
+      chmodSync(p.dir, 0o1777);
+      expect(foreignReason(p.file)).toBeUndefined();
+      expect(chooseWorkspace(undefined, p.dir)).toMatchObject({ source: "project", projectTrusted: true });
+    } finally {
+      chmodSync(p.dir, 0o700);
+    }
+  });
+
+  it("B-P2-4: the file is checked and read through one descriptor; a FIFO doesn't block", () => {
+    const p = project({ workspace: "acme" });
+    expect(inspectOwnedFile(p.file, true)).toEqual({ text: JSON.stringify({ workspace: "acme" }) });
+    expect(inspectOwnedFile(p.file)).toEqual({});
+    const fifoDir = mkdtempSync(join(root, "fifo-"));
+    execFileSync("mkfifo", [join(fifoDir, ".slacker.json")]);
+    expect(inspectOwnedFile(join(fifoDir, ".slacker.json"), true)).toMatchObject({ reason: "is not a regular file" });
+    expect(chooseWorkspace(undefined, fifoDir).foreignProject?.reason).toBe("is not a regular file");
+  });
+
+  it("B-P2-7: a trust file others could write is refused (invalid_trust_file): nothing counts as trusted", () => {
+    const p = project({ workspace: "acme" });
+    recordTrust(p.real, "acme");
+    const trustFile = process.env.SLACKER_TRUST_FILE!;
+    expect(chooseWorkspace(undefined, p.dir).projectTrusted).toBe(true);
+    for (const m of [0o660, 0o606]) {
+      chmodSync(trustFile, m);
+      expect(() => loadTrust(trustFile)).toThrow(expect.objectContaining({ code: "invalid_trust_file", message: expect.stringContaining("so someone else could have added trust records") }));
+      const c = chooseWorkspace(undefined, p.dir);
+      expect(c).toMatchObject({ projectTrusted: false, trustError: expect.stringContaining(`Ignoring the trust file ${trustFile}`) });
+      expect(projectWriteBlock(c)).toMatchObject({ code: "untrusted_project" });
+      expect(() => recordTrust(p.real, "acme")).toThrow(expect.objectContaining({ code: "invalid_trust_file" }));
+    }
+    chmodSync(trustFile, 0o600);
+    expect(chooseWorkspace(undefined, p.dir).projectTrusted).toBe(true);
+  });
+
+  it("B-P2-5: trust keys are canonical realpaths (realpathSync.native), so case variants match", () => {
+    const p = project({ workspace: "acme" });
+    expect(trustKey(p.file)).toBe(realpathSync.native(p.file));
+    expect(trustKey(join(p.dir, "missing.json"))).toBe(join(realpathSync.native(p.dir), "missing.json"));
+    const upper = p.file.toUpperCase();
+    if (existsSync(upper)) {
+      // Case-insensitive file system: every spelling has one key.
+      expect(trustKey(upper)).toBe(trustKey(p.file));
+      expect(findProjectSettings(p.dir.toUpperCase())?.realFile).toBe(trustKey(p.file));
+    }
+  });
+
+  it("D3: recheckWriteBlock re-reads the file and the trust store on every call", () => {
+    const p = project({ workspace: "acme" });
+    const start = chooseWorkspace(undefined, p.dir);
+    expect(recheckWriteBlock(start, { cwd: p.dir })).toMatchObject({ code: "untrusted_project" });
+    recordTrust(p.real, "acme");
+    expect(recheckWriteBlock(start, { cwd: p.dir })).toBeUndefined();
+    removeTrust(p.real);
+    expect(recheckWriteBlock(start, { cwd: p.dir })?.message).toContain("To use a different workspace for one command, pass -w <name>.");
+    expect(recheckWriteBlock(start, { cwd: p.dir, surface: "mcp" })?.message).toContain("Ask the user to check it and run `slacker trust` in");
+    recordTrust(p.real, "acme");
+    writeFileSync(p.file, "{oops");
+    expect(recheckWriteBlock(start, { cwd: p.dir })).toMatchObject({ code: "invalid_project_file" });
+    // -w: the file's workspace doesn't matter, but a file appearing later still can't take over.
+    rmSync(p.file);
+    const flagged = chooseWorkspace("side", p.dir);
+    expect(recheckWriteBlock(flagged, { cwd: p.dir, flag: "side" })).toBeUndefined();
+    writeFileSync(p.file, JSON.stringify({ readOnly: true }));
+    expect(recheckWriteBlock(flagged, { cwd: p.dir, flag: "side" })).toMatchObject({ code: "read_only" });
+  });
+
+  it("a .slacker.json that isn't a regular file is foreign (never read)", () => {
+    const dir = mkdtempSync(join(root, "trust-proj-"));
+    mkdirSync(join(dir, ".slacker.json"));
+    expect(foreignReason(join(dir, ".slacker.json"))).toBe("is not a regular file");
+    expect(chooseWorkspace(undefined, dir).foreignProject?.reason).toBe("is not a regular file");
+  });
+
+  it("a symlink to another project's trusted file doesn't borrow its trust; trusting the link itself works", () => {
+    const p = project({ workspace: "acme" });
+    recordTrust(p.real, "acme");
+    // e.g. a cloned repo shipping .slacker.json -> ../your-trusted-project/.slacker.json
+    const linkDir = mkdtempSync(join(root, "trust-link-"));
+    const link = join(linkDir, ".slacker.json");
+    symlinkSync(p.file, link);
+    expect(trustKey(link)).toBe(join(realpathSync.native(linkDir), ".slacker.json"));
+    let c = chooseWorkspace(undefined, linkDir);
+    expect(c).toMatchObject({ source: "project", name: "acme", projectTrusted: false, projectFile: link });
+    expect(projectWriteBlock(c)).toMatchObject({ code: "untrusted_project" });
+    // The original project is still trusted, and trusting the link (an owned link to an owned file) works.
+    expect(chooseWorkspace(undefined, p.dir).projectTrusted).toBe(true);
+    recordTrust(trustKey(link), "acme");
+    c = chooseWorkspace(undefined, linkDir);
+    expect(c.projectTrusted).toBe(true);
+    expect(projectWriteBlock(c)).toBeUndefined();
+  });
+
+  it("a symlinked project directory still resolves to the same trust key", () => {
+    const p = project({ workspace: "acme" });
+    recordTrust(p.real, "acme");
+    const alias = join(mkdtempSync(join(root, "trust-alias-")), "proj");
+    symlinkSync(p.dir, alias);
+    expect(trustKey(join(alias, ".slacker.json"))).toBe(p.real);
+    expect(chooseWorkspace(undefined, alias).projectTrusted).toBe(true);
+  });
+});
+
+describe("writeFileAtomic clearBits", () => {
+  it("drops the given bits from an existing file's mode", () => {
+    const dir = join(root, `clear${++n}`);
+    mkdirSync(dir);
+    const file = join(dir, ".slacker.json");
+    writeFileSync(file, "{}");
+    chmodSync(file, 0o666);
+    writeFileAtomic(file, '{"workspace":"w"}', 0o644, { clearBits: 0o022 });
+    expect(mode(file)).toBe(0o644);
   });
 });
