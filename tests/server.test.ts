@@ -12,8 +12,8 @@ import { createServer, ServerOptions, UNTRUSTED_NOTICE } from "../src/server.js"
 import { SlackSession } from "../src/session.js";
 import { installSlackStub, makeUser, paginate, restoreAll, writeTempConfig, TempConfig } from "./helpers/slackStub.js";
 
-const READ_TOOLS = ["whoami", "read_messages", "read_thread", "search_messages", "list_channels", "find_user", "list_unread", "get_status"];
-const WRITE_TOOLS = ["send_message", "edit_message", "delete_message", "add_reaction", "set_status"];
+const READ_TOOLS = ["whoami", "read_messages", "read_thread", "search_messages", "list_channels", "find_user", "list_unread", "get_status", "list_webhook_personas"];
+const WRITE_TOOLS = ["send_message", "edit_message", "delete_message", "add_reaction", "set_status", "send_webhook_message"];
 const CHANNEL = "C0123456789";
 const TS = "1760000000.000100";
 const LINK = `https://work.slack.com/archives/${CHANNEL}/p1760000000000100`;

@@ -43,6 +43,20 @@ import {
 } from "./output.js";
 import { errorMessage } from "./util.js";
 import { VERSION } from "./version.js";
+import {
+  addPersona,
+  listPersonas,
+  loadWebhooks,
+  removePersona,
+  resolvePersona,
+  sendWebhook,
+  personaUsesWorkspace,
+  setDefaultPersona,
+  validatePersonaFields,
+  WEBHOOK_ENV,
+  webhookWorkspace,
+  webhookWriteBlock,
+} from "./webhook.js";
 
 interface GlobalOpts {
   workspace?: string;
@@ -145,17 +159,23 @@ async function readAll(stream: NodeJS.ReadableStream): Promise<string> {
 const QUOTE_HINT = {
   send: 'Quote the message: slacker send general "your message" (use -- before text that starts with -)',
   edit: 'Quote the message: slacker edit <message link> "new text" (use -- before text that starts with -)',
+  "webhook send": 'Quote the message: slacker webhook send "your message" (use -- before text that starts with -)',
+};
+const PIPE_EXAMPLE = {
+  send: 'echo "hi" | slacker send <target> -',
+  edit: 'echo "hi" | slacker edit <target> -',
+  "webhook send": 'echo "hi" | slacker webhook send -',
 };
 
 /**
- * The single text argument of send/edit. Extra words mean the text wasn't quoted (and options inside
- * it may already have been taken as flags), so refuse. "-" — and only "-" — reads stdin.
+ * The single text argument of send/edit/webhook send. Extra words mean the text wasn't quoted (and
+ * options inside it may already have been taken as flags), so refuse. "-" — and only "-" — reads stdin.
  */
-async function messageText(ctx: Context, text: string, verb: "send" | "edit"): Promise<string> {
-  if (ctx.cmd.args.length > 2) throw new SlackerError(QUOTE_HINT[verb], "unquoted_text");
+async function messageText(ctx: Context, text: string, verb: keyof typeof QUOTE_HINT): Promise<string> {
+  if (ctx.cmd.args.length > ctx.cmd.registeredArguments.length) throw new SlackerError(QUOTE_HINT[verb], "unquoted_text");
   if (text !== "-") return text;
   if (ctx.io.stdin.isTTY) {
-    throw new SlackerError(`Text "-" reads the message from stdin, but stdin is a terminal. Pipe it in: echo "hi" | slacker ${verb} <target> -`, "invalid_argument");
+    throw new SlackerError(`Text "-" reads the message from stdin, but stdin is a terminal. Pipe it in: ${PIPE_EXAMPLE[verb]}`, "invalid_argument");
   }
   const piped = (await readAll(ctx.io.stdin)).replace(/\r\n/g, "\n").replace(/\n+$/, "");
   if (!piped.trim()) throw new SlackerError("Message text from stdin is empty.", "invalid_argument");
@@ -172,9 +192,9 @@ async function confirm(io: CliIO, question: string): Promise<boolean> {
 }
 
 /** Ask each question on stderr and read answers from a TTY in raw mode, so nothing is echoed. */
-function promptHidden(io: CliIO, questions: string[]): Promise<string[]> {
+function promptHidden(io: CliIO, questions: string[], instead = "Set SLACK_TOKEN and SLACK_COOKIE instead."): Promise<string[]> {
   const input = io.stdin;
-  if (!input.setRawMode) throw new SlackerError("Can't read secrets without echo from this terminal. Set SLACK_TOKEN and SLACK_COOKIE instead.", "no_tty");
+  if (!input.setRawMode) throw new SlackerError(`Can't read secrets without echo from this terminal. ${instead}`, "no_tty");
   const answers: string[] = [];
   let current = "";
   process.stderr.write(questions[0]);
@@ -232,6 +252,32 @@ async function readSecrets(io: CliIO): Promise<{ token: string; cookie: string }
     throw new SlackerError("Expected two lines on stdin: the xoxc token, then the xoxd cookie. Or set SLACK_TOKEN and SLACK_COOKIE.", "invalid_argument");
   }
   return { token: lines[0], cookie: lines[1] };
+}
+
+const PIPE_URL = `printf '%s\\n' "$URL" | slacker webhook add <persona>`;
+
+/**
+ * The webhook URL for `webhook add`: a hidden prompt, else the first line of piped stdin.
+ * Deliberately not SLACKER_WEBHOOK_URL: that variable defines the ad-hoc persona for posting, and
+ * reading it here too would silently re-point every persona you update while it's exported.
+ */
+async function readWebhookUrl(io: CliIO): Promise<string> {
+  if (io.stdin.isTTY) {
+    const [url] = await promptHidden(io, ["Slack webhook URL (input hidden): "], `Pipe it in instead: ${PIPE_URL}`);
+    return url;
+  }
+  const first = (await readAll(io.stdin))
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .find(Boolean);
+  if (!first) throw new SlackerError(`Expected the webhook URL on stdin: ${PIPE_URL} (or run it in a terminal to be asked).`, "invalid_argument");
+  return first;
+}
+
+/** How a persona looks on a message: `"Deploy Bot" :rocket:`. */
+function personaLook(r: { username: string | null; icon: string | null }): string {
+  const name = r.username ? `"${r.username}"` : dim("(webhook's own name)");
+  return r.icon ? `${name} ${r.icon}` : name;
 }
 
 /** Strict whole-number option parser with an inclusive range. */
@@ -368,8 +414,9 @@ Examples:
     .command("serve", { isDefault: true })
     .description("start the MCP server on stdio (the default when stdin isn't a terminal)")
     .option("--read-only", "hide all write tools")
+    .option("--webhook-only", "serve only the webhook persona tools (no slack-cli credentials needed; see slacker webhook --help)")
     .allowExcessArguments()
-    .action(async (o: { readOnly?: boolean }, cmd: Command) => {
+    .action(async (o: { readOnly?: boolean; webhookOnly?: boolean }, cmd: Command) => {
       // Unknown commands land here because serve is the default command.
       if (cmd.args.length) {
         if (program.args[0] === "serve") throw new SlackerError(`serve takes no arguments (got "${cmd.args.join(" ")}").`, "invalid_argument");
@@ -385,10 +432,17 @@ Examples:
       let opts: Parameters<typeof startServer>[0];
       try {
         const choice = chooseWorkspace(g.workspace, io.cwd);
-        opts = { workspace: choice.name, configFile, readOnly: !!o.readOnly || choice.readOnly, choice, cwd: io.cwd };
+        opts = { workspace: choice.name, configFile, readOnly: !!o.readOnly || choice.readOnly, choice, cwd: io.cwd, webhookOnly: !!o.webhookOnly };
       } catch (e) {
         // Corrupt .slacker.json: start degraded so the MCP client shows the reason (D10).
-        opts = { configFile, readOnly: !!o.readOnly || parseBoolEnv(process.env.SLACKER_READ_ONLY), startupError: errorMessage(e) };
+        opts = {
+          workspace: g.workspace,
+          configFile,
+          readOnly: !!o.readOnly || parseBoolEnv(process.env.SLACKER_READ_ONLY),
+          startupError: errorMessage(e),
+          cwd: io.cwd,
+          webhookOnly: !!o.webhookOnly,
+        };
       }
       if (io.stdin.isTTY) {
         console.error(dim("slacker MCP server listening on stdio — Ctrl+C to quit. Run `slacker --help` for CLI commands."));
@@ -738,6 +792,180 @@ Examples:
       )
     );
 
+  // ── Webhook personas (as a bot, not as you) ────────────
+  const webhook = program
+    .command("webhook")
+    .description("post as a bot persona (name + icon) through a Slack incoming webhook — no slack-cli credentials needed")
+    .addHelpText(
+      "after",
+      `
+A persona is a webhook URL plus a bot name, an icon (emoji name or image URL) and optionally a
+default channel. Personas are kept in ~/.config/slacker/webhooks.json (0600; SLACKER_WEBHOOKS_FILE
+overrides). The URL is a secret, so \`webhook add\` reads it from a hidden prompt or stdin — never
+from an argument.
+
+Which persona posts (first match wins): --persona, SLACKER_WEBHOOK_PERSONA, the ad-hoc persona from
+SLACKER_WEBHOOK_URL (+ SLACKER_WEBHOOK_USERNAME, _ICON, _CHANNEL), the default for the workspace
+named with -w / SLACKER_WORKSPACE / a trusted ${PROJECT_FILE}, then the global default. With a
+workspace named, the global default is used only if it's on that workspace's team.
+
+Webhooks created by a Slack app always post to the channel they were added to, with the app's name
+and icon. Bot name, icon and channel overrides only apply to legacy "Incoming WebHooks" integrations.
+
+Examples:
+  slacker webhook add deploy-bot --username "Deploy Bot" --icon rocket --channel deploys
+  slacker -w acme webhook add acme-alerts --username "Acme Alerts" --icon :rotating_light:
+  slacker webhook send "Build 142 is live ✅"
+  slacker webhook send -p acme-alerts --channel '#oncall' "CPU at 95% on api-3"
+  git log -1 --format=%B | slacker webhook send -
+  slacker webhook default acme-alerts -w acme`
+    );
+
+  webhook
+    .command("add")
+    .description("add a persona, or update one (fields you don't pass are kept; pass \"\" to clear one)")
+    .argument("<persona>", "name to save it under, e.g. deploy-bot")
+    .option("--username <bot name>", "bot name shown on the message")
+    .option("--icon <emoji|url>", "bot icon: a Slack emoji name (robot_face or :robot_face:) or an image URL")
+    .option("--channel <channel>", "default channel (#name, name, @user or ID); without one it posts to the webhook's own channel")
+    .option("--keep-url", "updating an existing persona: keep its webhook URL instead of asking for it")
+    .option("--force", "save even though the webhook's team isn't the team config.json has for -w")
+    .addOption(new Option("--url <url>").hideHelp())
+    .addHelpText(
+      "after",
+      `\nThe webhook URL is read from a hidden prompt, else the first line of stdin: ${PIPE_URL}\n` +
+        "-w <workspace> labels the persona (for a new persona it's detected from config.json when exactly one workspace is the webhook's team; -w \"\" removes the label)."
+    )
+    .action(
+      run(
+        async (ctx, name: string, o: { username?: string; icon?: string; channel?: string; keepUrl?: boolean; force?: boolean; url?: string }) => {
+          if (o.url !== undefined) {
+            throw new SlackerError(
+              withRunNote(`--url isn't accepted: webhook URLs are secrets and arguments end up in shell history. Run \`slacker webhook add <persona>\` and paste it when asked, or pipe it in: ${PIPE_URL}`),
+              "secret_in_argv"
+            );
+          }
+          // Validate everything that doesn't need the URL before asking for it.
+          validatePersonaFields({ name, username: o.username, icon: o.icon, channel: o.channel, workspace: ctx.opts.workspace });
+          if (o.keepUrl && !Object.hasOwn(loadWebhooks().personas, name)) {
+            throw new SlackerError(`--keep-url updates an existing persona, but "${name}" doesn't exist yet.`, "invalid_argument");
+          }
+          const url = o.keepUrl ? undefined : await readWebhookUrl(ctx.io);
+          return addPersona(
+            { name, url, username: o.username, icon: o.icon, channel: o.channel, workspace: ctx.opts.workspace, force: o.force },
+            { configFile: ctx.file }
+          );
+        },
+        (r) => {
+          console.log(green(`✓ ${r.action === "added" ? "Added" : "Updated"} persona "${r.persona}"`) + ` → ${personaLook(r)}`);
+          const ws = r.workspace ? ` (workspace "${r.workspace}"${r.workspaceDetected ? ", matched in config.json" : ""})` : "";
+          console.log(dim(`  posts to ${r.channel ?? "the webhook's own channel"} · team ${r.teamId}${ws}`));
+          console.log(dim(`  ${r.webhook}`));
+          if (r.urlChanged) console.log(yellow("  Webhook URL replaced."));
+          const roles = [r.becameDefault && "the default persona", r.becameWorkspaceDefault && `the default for workspace "${r.workspace}"`].filter(Boolean);
+          if (roles.length) console.log(dim(`  Now ${roles.join(" and ")}.`));
+          if (r.username || r.icon || r.channel) {
+            printNotes(["Webhooks created by a Slack app ignore the bot name, icon and channel; legacy Incoming WebHooks honour them."]);
+          }
+        }
+      )
+    );
+
+  webhook
+    .command("list")
+    .description("list personas (webhook URLs are shown with the secret part hidden)")
+    .action(
+      run(
+        () => listPersonas(),
+        (r) => {
+          if (!r.personas.length && !r.env) console.log(dim(`No webhook personas (${r.file}). Add one with: slacker webhook add <persona>`));
+          printTable(
+            r.personas.map((p) => [
+              (p.isDefault ? "* " : "  ") + bold(p.name),
+              personaLook(p),
+              p.channel ?? dim("(webhook's channel)"),
+              p.workspace ? `workspace "${p.workspace}"` : "",
+              dim(p.defaultFor.length ? `default for ${p.defaultFor.join(", ")}` : ""),
+              dim(p.webhook),
+            ])
+          );
+          if (r.env) console.log(`${dim(`From ${WEBHOOK_ENV.url}:`)} ${personaLook(r.env)} → ${r.env.channel ?? dim("(webhook's channel)")} ${dim(r.env.webhook)}`);
+          if (r.envPersona) console.log(dim(`${WEBHOOK_ENV.persona}=${r.envPersona} is used when no persona is named.`));
+        }
+      )
+    );
+
+  webhook
+    .command("send")
+    .description("post a message as a persona")
+    .argument("<text>", 'the message (Slack mrkdwn), quoted as one argument; "-" reads it from stdin')
+    .option("-p, --persona <name>", "persona to post as (default: see `slacker webhook --help`)")
+    .option("--channel <channel>", "post to this channel instead of the persona's (#name, name, @user or ID)")
+    .option("--username <bot name>", "override the persona's bot name for this message")
+    .option("--icon <emoji|url>", "override the persona's icon for this message")
+    .option("--dry-run", "show who would post where, without posting")
+    .allowExcessArguments()
+    .action(
+      run(
+        async (ctx, textArg: string, o: { persona?: string; channel?: string; username?: string; icon?: string; dryRun?: boolean }) => {
+          const text = await messageText(ctx, textArg, "webhook send");
+          const block = webhookWriteBlock(ctx.choice, "cli", { dryRun: !!o.dryRun, usesWorkspace: personaUsesWorkspace({ persona: o.persona }) });
+          if (block) throw block;
+          const persona = resolvePersona(
+            { persona: o.persona, workspace: webhookWorkspace(ctx.choice), channel: o.channel, username: o.username, icon: o.icon },
+            { configFile: ctx.file }
+          );
+          return sendWebhook(persona, text, { dryRun: !!o.dryRun });
+        },
+        (r, _ctx, raw) => {
+          const where = `${bold(r.channel ?? "the webhook's own channel")} ${dim("·")} team ${r.teamId}${r.workspace ? dim(` (workspace "${r.workspace}")`) : ""}`;
+          if (r.dryRun) {
+            console.log(`${yellow("Would post as")} ${personaLook(r)} ${dim(`(persona "${r.persona}")`)}`);
+            console.log(`→ ${where}`);
+            if (raw.text !== undefined) console.log(showControls(raw.text).split("\n").map((l) => `  ${l}`).join("\n"));
+            console.log(dim("Dry run — nothing was posted."));
+            return;
+          }
+          console.log(green("✓ Posted as ") + personaLook(r) + dim(` (persona "${r.persona}")`));
+          console.log(`→ ${where}`);
+        }
+      )
+    );
+
+  webhook
+    .command("default")
+    .description("set the default persona (with -w: that workspace's default)")
+    .argument("[persona]")
+    .option("--unset", "remove the default instead")
+    .action(
+      run(
+        (ctx, persona: string | undefined, o: { unset?: boolean }) => {
+          if (!!persona === !!o.unset) throw new SlackerError("Name a persona, or pass --unset (not both).", "invalid_argument");
+          return setDefaultPersona(persona ?? null, ctx.opts.workspace, { configFile: ctx.file });
+        },
+        (r) => {
+          const scope = r.workspace ? ` for workspace "${r.workspace}"` : "";
+          if (!r.persona && !r.previous) return console.log(yellow(`No default persona was set${scope}; nothing changed.`));
+          const line = r.persona ? `✓ Default persona${scope}: ${r.persona}` : `✓ Removed the default persona${scope}`;
+          console.log(green(line) + (r.previous && r.previous !== r.persona ? dim(` (was ${r.previous})`) : ""));
+        }
+      )
+    );
+
+  webhook
+    .command("remove")
+    .description("remove a persona")
+    .argument("<persona>")
+    .action(
+      run(
+        (_ctx, name: string) => removePersona(name),
+        (r) => {
+          console.log(green(`✓ Removed persona "${r.removed}"`) + dim(` · default persona: ${r.defaultPersona ?? "(none)"}`));
+          if (r.clearedWorkspaceDefaults.length) console.log(dim(`  No longer the default for: ${r.clearedWorkspaceDefaults.join(", ")}`));
+        }
+      )
+    );
+
   // ── Project setup ──────────────────────────────────────
   program
     .command("init")
@@ -1001,6 +1229,7 @@ interface ErrorReport {
 }
 
 const DASH_HINT = 'Put -- before message text that starts with "-": slacker send general -- "-1 from me"';
+const WEBHOOK_DASH_HINT = 'Put -- before message text that starts with "-": slacker webhook send -- "-1 from me"';
 
 /** Message text starting with "-" that commander took for an option (e.g. `send general "-w side"`). */
 const looksLikeDashText = (args: string[]) => args.some((a) => /^-[^-]/.test(a) && /\s/.test(a));
@@ -1020,7 +1249,7 @@ function describeError(e: unknown, args: string[] = []): ErrorReport {
     const textLike =
       (e.code === "commander.unknownOption" && /'[^']*\s[^']*'/.test(message)) ||
       (e.code === "commander.missingArgument" && looksLikeDashText(args));
-    return { message, code: e.code, ...(textLike && { hint: DASH_HINT }) };
+    return { message, code: e.code, ...(textLike && { hint: args.includes("webhook") ? WEBHOOK_DASH_HINT : DASH_HINT }) };
   }
   if (e instanceof SlackNetworkError) return { message: e.message, code: "network_error" };
   return { message: errorMessage(e) };

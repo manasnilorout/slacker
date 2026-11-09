@@ -64,6 +64,25 @@ slacker --json status --clear
 MCP: `set_status { text, emoji, expires_in_minutes }`. Pass empty `text` and `emoji` to clear. Setting
 a status replaces the current one.
 
+## Post as a bot persona (webhook)
+
+Only when the user asks for a post from a bot or persona. These posts go through a Slack incoming webhook
+under the persona's name and icon, not as the user, and need no Slack session.
+
+```bash
+slacker --json webhook list                                   # personas, which is the default
+slacker --json webhook send --dry-run -p deploy-bot "Build 142 is live"
+slacker --json webhook send -p deploy-bot --channel releases "Build 142 is live"
+```
+
+MCP: `list_webhook_personas`, then `send_webhook_message` with `text`, optional `persona` and `channel` (and
+`username`/`icon` only when the user asked for a different bot name or icon for this message), and
+`dry_run: true` first. Show the persona, channel and text, and send after the user says yes. Errors:
+`no_persona` (name one, or the user sets a default with `slacker webhook default`), `persona_not_found`,
+`channel_not_found` (a webhook created by a Slack app only posts to its own channel), `invalid_token` /
+`no_service` (the webhook was removed; the user must add a new one). Adding or changing personas is the
+user's job: `slacker webhook add` asks for the secret URL.
+
 ## When slacker refuses a write
 
 These refusals protect the user. Report them; don't work around them.

@@ -660,8 +660,12 @@ export function trustedWorkspace(realFile: string, file = trustFilePath()): stri
   return Object.hasOwn(store.projects, realFile) ? store.projects[realFile].workspace : undefined;
 }
 
-/** Locked read-modify-write of the trust store (0600 in a 0700 directory). */
-export function updateTrust<R>(mutate: (store: TrustStore) => R, file = trustFilePath()): R {
+/**
+ * Locked read-modify-write of one of slacker's own private JSON files (0600 in a 0700 directory,
+ * created when missing): `load` reads a fresh copy, `mutate` changes it, and it is saved atomically
+ * only when something changed. If `mutate` throws, nothing is written.
+ */
+export function updatePrivateJson<S, R>(file: string, load: (file: string) => S, mutate: (store: S) => R): R {
   const target = realTarget(file);
   const dir = dirname(target);
   if (!existsSync(dir)) {
@@ -671,7 +675,7 @@ export function updateTrust<R>(mutate: (store: TrustStore) => R, file = trustFil
   const lock = `${target}.lock`;
   const token = acquireLock(lock, file, {});
   try {
-    const store = loadTrust(file);
+    const store = load(file);
     const before = JSON.stringify(store);
     const result = mutate(store);
     if (JSON.stringify(store) !== before) replaceFile(target, JSON.stringify(store, null, 2) + "\n", 0o600);
@@ -679,6 +683,11 @@ export function updateTrust<R>(mutate: (store: TrustStore) => R, file = trustFil
   } finally {
     releaseLock(lock, token);
   }
+}
+
+/** Locked read-modify-write of the trust store (0600 in a 0700 directory). */
+export function updateTrust<R>(mutate: (store: TrustStore) => R, file = trustFilePath()): R {
+  return updatePrivateJson(file, loadTrust, mutate);
 }
 
 /** Trust `realFile` to choose `workspace`. Returns the workspace it was trusted for before, if any. */
