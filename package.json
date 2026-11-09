@@ -1,7 +1,7 @@
 {
   "name": "@manasnilorout/slacker",
   "version": "0.1.0",
-  "description": "Local MCP server that talks to Slack as you, using slack-cli credentials",
+  "description": "Local MCP server and CLI that talk to Slack as you (slack-cli credentials), or as a bot persona through incoming webhooks",
   "scripts": {
     "build": "node scripts/clean-dist.mjs && tsc -p tsconfig.json && node scripts/chmod-bin.mjs",
     "dev": "tsc -p tsconfig.json --watch",

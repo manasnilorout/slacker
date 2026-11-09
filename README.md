@@ -18,6 +18,8 @@ what you can see, and what it sends shows up as you.
   same code backs both.
 - **A workspace per project.** `slacker init <workspace> --mcp` pins a project to a workspace for both the CLI and
   Claude Code.
+- **Bot personas too.** `slacker webhook …` and the `send_webhook_message` tool post through a Slack incoming
+  webhook with a bot name and icon you choose, with no Slack session needed ([below](#post-as-a-bot-persona-webhooks)).
 - **Built not to post in the wrong place.**
   - Bare names only ever match channels, never people.
   - Message links reply in their thread.
@@ -85,6 +87,7 @@ After `slacker init <workspace> --mcp`, Claude Code starts slacker as an MCP ser
 | --- | --- |
 | Read tools | `whoami`, `read_messages`, `read_thread`, `search_messages`, `list_channels`, `find_user`, `list_unread`, `get_status` |
 | Write tools | `send_message` (with `dry_run`), `edit_message`, `delete_message`, `add_reaction`, `set_status` |
+| Webhook tools | `list_webhook_personas`, `send_webhook_message` (posts as a bot persona, [below](#post-as-a-bot-persona-webhooks)) |
 | Prompts | `triage_unread`, `reply_to_thread`, `summarize_channel` |
 
 - **Read-only projects:** `slacker init <workspace> --mcp --read-only` hides the write tools.
@@ -96,6 +99,66 @@ After `slacker init <workspace> --mcp`, Claude Code starts slacker as an MCP ser
 
 Details: [connecting Claude Code](docs/setup-guide.md#5-connect-claude-code) ·
 [tools and parameters](docs/reference.md#tools) · [safety model](docs/reference.md#safety-model).
+
+## Post as a bot persona (webhooks)
+
+Sometimes a message should come from a bot ("Deploy Bot 🚀"), not from you. slacker can post through a Slack
+[incoming webhook](https://api.slack.com/messaging/webhooks) as a **persona**: a webhook URL, a bot name, an icon
+(an emoji name or an image URL) and an optional default channel. This needs no Slack session, so it works on a
+machine with no slack-cli credentials at all.
+
+```bash
+# Save a persona (the URL is asked for with hidden input, or piped in on stdin; never an argument)
+slacker webhook add deploy-bot --username "Deploy Bot" --icon rocket --channel deploys
+slacker -w acme webhook add acme-alerts --username "Acme Alerts" --icon :rotating_light:   # labelled for workspace acme
+
+slacker webhook send "Build 142 is live ✅"                         # the default persona
+slacker webhook send -p acme-alerts --channel oncall "CPU at 95% on api-3"
+slacker webhook send --dry-run "who would post this, where?"
+slacker webhook list                                                # URLs shown with the secret part hidden
+slacker webhook default acme-alerts -w acme                         # acme's default persona
+```
+
+Personas are stored in `~/.config/slacker/webhooks.json` (0600). The first persona becomes the default, and the
+first one for a workspace becomes that workspace's default. `-w` labels a persona with a workspace (detected
+automatically when its webhook's team matches one in config.json). When sending, `-w`, `SLACKER_WORKSPACE` or a
+trusted `.slacker.json` picks the workspace whose default persona posts, and slacker won't fall back to a default
+persona on another Slack team. In MCP clients, configure a persona straight from the server entry, for example
+with `npx`:
+
+```json
+{
+  "mcpServers": {
+    "deploy-bot": {
+      "command": "npx",
+      "args": ["-y", "github:manasnilorout/slacker", "serve", "--webhook-only"],
+      "env": {
+        "SLACKER_WEBHOOK_URL": "https://hooks.slack.com/services/T…/B…/…",
+        "SLACKER_WEBHOOK_USERNAME": "Deploy Bot",
+        "SLACKER_WEBHOOK_ICON": "rocket",
+        "SLACKER_WEBHOOK_CHANNEL": "#deploys"
+      }
+    }
+  }
+}
+```
+
+`--webhook-only` serves just `list_webhook_personas` and `send_webhook_message`. Without it, the webhook tools sit
+next to the normal ones. Use `SLACKER_WEBHOOK_PERSONA=<name>` instead of the URL to pick a stored persona.
+
+The webhook URL is a secret: keep this entry out of a committed project `.mcp.json`, and pin `github:…` to a
+commit you've reviewed. For example, in local scope and without the URL landing in your shell history:
+
+```bash
+read -rs URL    # paste the webhook URL, then Enter (nothing is shown)
+claude mcp add --scope local deploy-bot -e SLACKER_WEBHOOK_URL="$URL" -- npx -y github:manasnilorout/slacker#<commit> serve --webhook-only
+unset URL
+```
+
+> Webhooks created by a **Slack app** always post to the channel they were added to, with the app's name and icon:
+> Slack ignores the bot name, icon and channel. Legacy **Incoming WebHooks** integrations honour all three.
+
+Details: [webhook personas](docs/reference.md#webhook-personas).
 
 ## Claude Code plugin (skill + agent)
 

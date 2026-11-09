@@ -7,6 +7,7 @@ Everything slacker does, in detail. New here? Start with the [README](../README.
 - [Choosing a workspace](#choosing-a-workspace)
 - [Project setup: `slacker init`](#project-setup-slacker-init)
 - [CLI reference](#cli-reference)
+- [Webhook personas](#webhook-personas)
 - [MCP server](#mcp-server)
 - [Safety model](#safety-model)
 - [Limits and plan notes](#limits-and-plan-notes)
@@ -431,6 +432,7 @@ slacker trust --list                        # or: --remove [file]
 | `delete <target>` | `--ts <ts>`, `-y/--yes`, `--allow-alias` |
 | `react <target> <emoji>` | `--ts <ts>`, `--allow-alias` |
 | `trust` | `--remove [file]`, `--list`. See [trust](#trusting-a-projects-slackerjson) |
+| `webhook …` | `add`, `send`, `list`, `default`, `remove`. See [webhook personas](#webhook-personas) |
 | `init`, `auth …`, `serve` | See [init](#project-setup-slacker-init), [credentials](#credentials), [MCP](#mcp-server) |
 
 Numbers must be whole numbers in range. `-n abc`, `-n 10abc`, and `-n 0` are errors. A mistyped command
@@ -490,10 +492,111 @@ Errors print to **stdout** as JSON, with exit code 1:
 Without `--json`, errors go to stderr as `slacker: <message>`; the message already contains the fix, so the hint
 isn't repeated. Like all human-readable output, the message is [sanitized](#safety-model) first.
 
+## Webhook personas
+
+`slacker webhook …` posts through a Slack incoming webhook as a **persona** instead of as you. It doesn't use
+config.json credentials, so it works without `auth setup`.
+
+A persona is:
+
+| Field | Set with | Notes |
+| --- | --- | --- |
+| webhook URL | a hidden prompt, or the first line of stdin (`printf '%s\n' "$URL" \| slacker webhook add <persona>`) | `https://hooks.slack.com/services/T…/B…/…` (or `hooks.slack-gov.com`). A secret: never accepted as an argument (`--url`, or a URL where a persona name, workspace, channel, icon or bot name belongs, fails with `secret_in_argv` without echoing it), never printed in full (`…/T…/B…/••••`). `add` deliberately ignores `SLACKER_WEBHOOK_URL`, which only defines the ad-hoc persona for posting. |
+| bot name | `--username <bot name>` | Up to 80 characters, no line breaks, control characters or bidi overrides. |
+| icon | `--icon <emoji\|url>` | An emoji shortcode such as `rocket`, `:rocket:` or `+1` (sent as `icon_emoji`; not the emoji character itself), or an `http(s)` image URL (sent as `icon_url`). |
+| default channel | `--channel <channel>` | `#name`, a bare name (a channel), or a conversation ID; `@user` only where Slack still allows webhooks to post to people. Without one, the webhook's own channel. |
+| workspace | the global `-w <name>` (only `-w`; `SLACKER_WORKSPACE` doesn't label) | A label for per-workspace defaults. For a new persona it's detected from config.json when exactly one workspace has the webhook's team (`T…` in the URL); `-w ""` removes it. For a new persona, and whenever the label or the URL changes, a label whose config.json team differs from the webhook's is refused (`team_mismatch`) unless you pass `--force`; a label saved that way never becomes the workspace's default automatically. |
+
+> Webhooks created by a **Slack app** always post to the channel picked when the app was added, with the app's
+> name and icon; Slack silently ignores `username`, `icon_*` and `channel`. Legacy **Incoming WebHooks**
+> integrations honour them.
+
+```bash
+slacker webhook add <persona> [--username <n>] [--icon <i>] [--channel <c>] [--keep-url] [--force]
+slacker webhook send <text> [-p <persona>] [--channel <c>] [--username <n>] [--icon <i>] [--dry-run]
+slacker webhook list
+slacker webhook default <persona> | --unset        # with -w: that workspace's default
+slacker webhook remove <persona>
+```
+
+- `add` creates a persona or updates one. When updating, options you leave out keep their value, `""` clears one
+  (`--channel ""`), and `--keep-url` keeps the stored URL instead of asking for it ("Webhook URL replaced" is
+  printed when it changes). The first persona added becomes the default; the first persona for a workspace
+  becomes that workspace's default. Updates never bring back a default you removed.
+- `default <persona> -w <ws>` refuses a persona on another team than config.json has for `<ws>`.
+- `send` takes the text as one quoted argument (`-` reads stdin), like `slacker send`. `--username`/`--icon`/
+  `--channel` override the persona for that message. `--dry-run` shows the persona, look and destination.
+- `remove` also clears any default that pointed at the persona.
+
+**Which persona posts** (first match wins):
+
+1. `-p/--persona` (MCP: `persona`)
+2. `SLACKER_WEBHOOK_PERSONA` (a stored persona)
+3. `SLACKER_WEBHOOK_URL`, with `SLACKER_WEBHOOK_USERNAME`, `SLACKER_WEBHOOK_ICON`, `SLACKER_WEBHOOK_CHANNEL`: an
+   ad-hoc persona called `env`, made for MCP `env` blocks
+4. the default of the workspace named by `-w`, `SLACKER_WORKSPACE` or a trusted `.slacker.json`
+5. the global default. With a workspace in use (step 4) that has no default, only if the global default is
+   provably on that workspace's team (its label, or config.json's `teamId`); otherwise `no_persona`, so a post
+   never lands in another Slack team just because a default exists
+
+**Storage.** `~/.config/slacker/webhooks.json` (`SLACKER_WEBHOOKS_FILE` overrides), written atomically under a lock
+as 0600 in a 0700 directory. A file owned by someone else or writable by group/others is refused
+(`invalid_webhook_file`), because it could redirect your posts.
+
+```json
+{
+  "version": 1,
+  "defaultPersona": "deploy-bot",
+  "workspaceDefaults": { "acme": "acme-alerts" },
+  "personas": {
+    "deploy-bot": { "url": "https://hooks.slack.com/services/…", "username": "Deploy Bot", "icon": ":rocket:", "channel": "#deploys" },
+    "acme-alerts": { "url": "https://hooks.slack.com/services/…", "username": "Acme Alerts", "icon": ":rotating_light:", "workspace": "acme" }
+  }
+}
+```
+
+**Safety.** Webhook posts follow the same project rules as other writes. A `.slacker.json` someone else controls
+refuses them (`untrusted_project`, dry runs too). A `.slacker.json` you haven't trusted refuses them too when its
+workspace would pick the persona (no persona named, and no `SLACKER_WEBHOOK_PERSONA`/`SLACKER_WEBHOOK_URL`); name
+the persona, or pass `-w`, to post without depending on the file. A read-only project (`"readOnly": true`, or
+`SLACKER_READ_ONLY`) refuses real posts (`read_only`; dry runs work).
+There's no live team check (a webhook has no `auth.test`); the team comes from the URL and is compared with
+config.json where it knows the workspace. A post is never retried, since a webhook has no way to drop a
+duplicate. Errors use Slack's code: `channel_not_found`, `channel_is_archived`,
+`action_prohibited`, `invalid_token`/`no_service` (the webhook was removed: add it again), `rate_limited`, and
+say whether the message was posted: "NOT posted" for a 4xx, a cancel before the request, or a failure before the
+request was sent (DNS, connection refused, unreachable network, TLS certificate); "may or may not have been
+posted" after a timeout, a reset or a 5xx.
+
+**MCP.** Two tools, available even when the Slack tools aren't configured:
+
+| Tool | Parameters | Notes |
+| --- | --- | --- |
+| `list_webhook_personas` | none | `file`, `personas` (name, `username`, `icon`, `channel`, `workspace`, `teamId`, redacted `webhook`, `isDefault`, `defaultFor`), the `env` persona, and `envPersona`. |
+| `send_webhook_message` ✍️ | `text`, `persona`, `channel`, `username`, `icon`, `dry_run` (false) | `username` and `icon` override the persona's bot name and icon for that message only (same rules as `--username`/`--icon`). The tool description and server instructions tell the model to set them only when you asked for that name or icon, and never to impersonate a real person. Hidden in read-only mode. |
+
+`slacker serve --webhook-only` registers just these two (no prompts, no slack-cli credentials needed). Each call
+re-reads `.slacker.json` and webhooks.json, so `slacker webhook add`, `slacker trust` and read-only changes apply
+without a reconnect; a `.slacker.json` that's corrupt at startup is reported in the instructions and stderr, and
+posts are refused until it's fixed.
+
+**A secret in an MCP config.** `SLACKER_WEBHOOK_URL` in a server entry is a secret like any other: don't put it
+in a project `.mcp.json` that is committed. Register it in local or user scope instead, reading it without echo
+so it stays out of your shell history:
+
+```bash
+read -rs URL    # paste the webhook URL, then Enter (nothing is shown)
+claude mcp add --scope local deploy-bot -e SLACKER_WEBHOOK_URL="$URL" -- npx -y github:manasnilorout/slacker#<commit> serve --webhook-only
+unset URL
+```
+
+Pin `github:…` to a commit or tag you've reviewed: an unpinned one runs whatever is on `main` with the secret in
+its environment.
+
 ## MCP server
 
 ```bash
-slacker serve [--read-only]       # plus the global -w / -c
+slacker serve [--read-only] [--webhook-only]   # plus the global -w / -c
 ```
 
 Register it with `slacker init <workspace> --mcp` (see above), with
@@ -518,6 +621,8 @@ Register it with `slacker init <workspace> --mcp` (see above), with
 | `delete_message` ✍️ | `target`, `ts` | Your own messages. This can't be undone. |
 | `add_reaction` ✍️ | `target`, `ts`, `emoji` | `thumbsup` or `:eyes:`. Reacting twice isn't an error. |
 | `set_status` ✍️ | `text` (≤100, `""` clears), `emoji` (""), `expires_in_minutes` 0–525600 (0 = never) | Replaces your status. |
+| `list_webhook_personas` | none | Bot personas for webhook posts. See [webhook personas](#webhook-personas). |
+| `send_webhook_message` ✍️ | `text`, `persona`, `channel`, `username`, `icon`, `dry_run` (false) | Posts as a bot persona through an incoming webhook, not as you. See [webhook personas](#webhook-personas). |
 
 ✍️ = write tools, hidden in read-only mode. Write results include `workspace`, `team`, `teamDomain`, and
 (except `set_status`) `destination` (`{id, type, name}`; `id` is `null` for a dry run to a person, whose DM
@@ -529,8 +634,8 @@ A post cancelled while in flight may or may not have reached Slack, and the erro
 
 **Untrusted `.slacker.json`.** Entries written by `init` pass `--workspace` explicitly, so they don't depend on
 `.slacker.json`. When `slacker serve` runs **without** `--workspace` and the workspace comes from a `.slacker.json`
-you haven't [trusted](#trusting-a-projects-slackerjson), the read tools work but every write tool (dry runs too)
-returns an `untrusted_project` error; the same goes for a `.slacker.json` that someone else controls. Over MCP
+you haven't [trusted](#trusting-a-projects-slackerjson), the read tools work but every write tool (dry runs too,
+and `send_webhook_message` when the file's workspace would pick its persona) returns an `untrusted_project` error; the same goes for a `.slacker.json` that someone else controls. Over MCP
 the error tells the agent to ask the user to check the file and run `slacker trust` in that directory, and doesn't
 offer `-w`. Trust is checked again on every write call, so after `slacker trust` (or `trust --remove`) the next
 call sees it, with no reconnect. If the `.slacker.json` now picks a different workspace than the server started
@@ -563,17 +668,19 @@ Any one of these turns it on:
   as on, so a typo still means read-only.
 - `"readOnly": true` in the `.slacker.json` the server finds from its working directory.
 
-In MCP, the write tools aren't registered at all. In the CLI, the last two settings make `send`, `edit`,
-`delete`, `react`, and `status --set/--clear` refuse with `Refusing to write: this project is read-only (…)`.
-`send --dry-run` still works. If a project becomes read-only after the server started (the `.slacker.json` now
+In MCP, the write tools aren't registered at all (`send_webhook_message` included). In the CLI, the last two
+settings make `send`, `edit`, `delete`, `react`, and `status --set/--clear` refuse with
+`Refusing to write: this project is read-only (…)`, and `webhook send` with `Refusing to post: …`.
+`send --dry-run` and `webhook send --dry-run` still work. If a project becomes read-only after the server started (the `.slacker.json` now
 says `"readOnly": true`), the write tools stay listed but refuse with `read_only`:
 `Refusing to write: this project is now read-only ("readOnly": true in <file>).`
 
 ### Degraded mode
 
 When the server can't resolve its workspace at startup (config.json missing, empty or corrupt, an unknown
-`--workspace`, or no default set), it **starts anyway**. The tool list is the normal one, but every tool
-returns `isError` with the reason and the commands to fix it. The server instructions and stderr say the same
+`--workspace`, or no default set), it **starts anyway**. The tool list is the normal one, but every Slack tool
+returns `isError` with the reason and the commands to fix it. The webhook tools don't use config.json, so they
+keep working (a corrupt `.slacker.json` still refuses posts). The server instructions and stderr say the same
 thing, so the client shows a real explanation instead of "connection closed".
 
 The check runs again on every call, so fixing config.json (`slacker auth setup`, `auth default`, `auth rename`)
@@ -606,11 +713,14 @@ refreshed too.
 | `edit` | `edit_message` | `--ts`→`ts` |
 | `delete` | `delete_message` | `--ts`→`ts`. Only the CLI asks for confirmation. |
 | `react` | `add_reaction` | `--ts`→`ts` |
-| `init`, `trust`, `auth …`, `serve` | none | CLI only |
+| `webhook send` | `send_webhook_message` | `-p`→`persona`, `--channel`→`channel`, `--username`→`username`, `--icon`→`icon`, `--dry-run`→`dry_run` |
+| `webhook list` | `list_webhook_personas` | none |
+| `init`, `trust`, `auth …`, `webhook add/default/remove`, `serve` | none | CLI only |
 
 ## Safety model
 
-- **Writes verify the live team.** Before any send, edit, delete, reaction or status change (dry runs too),
+- **Writes verify the live team.** (Webhook posts can't: see [webhook personas](#webhook-personas) for how they
+  are kept on the right team.) Before any send, edit, delete, reaction or status change (dry runs too),
   slacker calls `auth.test` and refuses if the credentials sign in to a different team than config.json says.
   It also refuses when another config.json name shares the team or the entry has no `teamId`, unless you pass
   `--allow-alias` in the CLI (MCP can't). Every write result, in the CLI and in MCP, names the team, the
@@ -638,8 +748,10 @@ refreshed too.
   server. A bare `slacker init` refuses an untrusted file instead of trusting it. `slacker init` refuses to read
   or rewrite a `.slacker.json` or `.mcp.json` that is a symlink leading outside the project (`unsafe_symlink`).
 - **`.mcp.json` isn't covered by trust.** A project's `.mcp.json` entry passes `--workspace` itself, so a repo
-  that ships one chooses the workspace its server writes to. Claude Code's approval prompt is the only gate:
-  read the `slacker` entry's `--workspace` and `command` before you approve it.
+  that ships one chooses the workspace its server writes to. It can also set `SLACKER_WEBHOOK_URL`,
+  `SLACKER_WEBHOOK_PERSONA` or `SLACKER_WEBHOOKS_FILE` in the entry's `env`, which decides where bot posts go.
+  Claude Code's approval prompt is the only gate: read the `slacker` entry's `--workspace`, `command` and `env`
+  before you approve it.
 - **Terminal output is sanitized.** Slack text is attacker-controlled: message text, user, display and real
   names, channel names, topics and purposes, statuses, file names, search snippets and team names can contain
   escape sequences that rewrite the screen, set the window title or write the clipboard (OSC 52). Human-readable
@@ -717,7 +829,8 @@ npm pack --dry-run   # what would be published (README, LICENSE, package.json, d
 | `src/node-check.ts` | Node.js 22.12+ check, with no imports so it runs on old Node |
 | `src/cli.ts` | Commander CLI: every command, `auth …`, `--json` errors |
 | `src/init.ts` | `slacker init`: `.slacker.json` / `.mcp.json`, the launch command (`--node`, `--command`, nvm detection) |
-| `src/server.ts` | MCP server: tools, instructions, read-only and degraded modes |
+| `src/server.ts` | MCP server: tools, instructions, read-only, degraded and webhook-only modes |
+| `src/webhook.ts` | Webhook personas: URL validation and redaction, the `webhooks.json` store, persona choice, posting |
 | `src/prompts.ts` | MCP workflow prompts and their safety rules |
 | `src/session.ts` | Every Slack operation for one workspace (re-reads config per call), time parsing, write identity checks |
 | `src/resolve.ts` | Target resolution (links, channels, people), caches, page-capped directory scans |

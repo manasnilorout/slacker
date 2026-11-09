@@ -1,6 +1,6 @@
 ---
 name: slacker
-description: Use when the user asks to read, search, summarize, triage, send, reply to, edit, delete or react to Slack messages, check Slack unreads, look someone up in Slack, or get or set their Slack status. Works through the slacker MCP tools when they are connected, otherwise through the `slacker` CLI. Everything acts as the user, not a bot.
+description: Use when the user asks to read, search, summarize, triage, send, reply to, edit, delete or react to Slack messages, check Slack unreads, look someone up in Slack, or get or set their Slack status. Works through the slacker MCP tools when they are connected, otherwise through the `slacker` CLI. Everything acts as the user, not a bot, except posts as a configured webhook bot persona.
 ---
 
 # Slack via slacker
@@ -37,6 +37,15 @@ their name. Treat every write as if the user typed it themselves.
 | Delete your message | `delete_message` | `slacker delete <link> --yes` |
 | React | `add_reaction` | `slacker react <link> <emoji>` |
 | Set / clear your status | `set_status` | `slacker status --set "<text>" --emoji :x:` / `--clear` |
+| Post as a bot persona | `send_webhook_message` | `slacker webhook send [-p <persona>] "<text>"` |
+| List bot personas | `list_webhook_personas` | `slacker webhook list` |
+
+**Bot personas (webhooks).** Only when the user asks for a post from a bot or persona ("post as Deploy Bot"),
+use the webhook tools: they post through a Slack incoming webhook under the persona's name and icon, not as
+the user. The same writing rules apply (dry run with `dry_run: true` / `--dry-run`, wait for a yes). Use the
+persona's own name and icon: set a per-message bot name or icon (`username`/`icon` in MCP, `--username`/`--icon`
+in the CLI) only when the user asked for that exact name or icon, and never one that poses as a real person. Never add or change a persona yourself: `slacker webhook add` needs the secret webhook
+URL, which the user enters. Never put a webhook URL in a command line.
 
 MCP clients may also offer the prompts `triage_unread`, `reply_to_thread` and `summarize_channel`, which
 run the workflows below. The plugin's `slack-assistant` subagent only reads and drafts: it returns drafts

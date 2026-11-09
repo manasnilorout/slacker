@@ -22,6 +22,8 @@ process.env.HOME = home;
 process.env.SLACKER_CONFIG = join(home, "no-config.json");
 process.env.SLACKER_TRUST_FILE = join(dir, "trusted-projects.json");
 process.env.PWD = pwd;
+// A developer's own webhook persona settings must never reach a test (or a real post).
+for (const key of Object.keys(process.env)) if (key.startsWith("SLACKER_WEBHOOK")) delete process.env[key];
 try {
   process.umask(0o022);
 } catch {

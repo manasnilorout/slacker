@@ -1,7 +1,11 @@
 # slacker setup guide
 
 A step-by-step walkthrough, from a fresh machine to Claude Code posting Slack messages as you, with one Slack
-workspace per project. Each step ends with a check so you know it worked.
+workspace per project, plus (optionally) posting as a bot persona through a Slack webhook. Each step ends with a
+check so you know it worked.
+
+Only want bot posts through a webhook, not Slack as you? Do [step 1](#1-install), then jump to
+[step 7](#7-post-as-a-bot-persona-webhooks): webhooks need no Slack credentials, no desktop app and no `sqlite3`.
 
 It takes about 10 minutes. For every option and edge case, see the [reference](reference.md).
 
@@ -11,8 +15,9 @@ It takes about 10 minutes. For every option and edge case, see the [reference](r
 4. [Pin a project to a workspace](#4-pin-a-project-to-a-workspace)
 5. [Connect Claude Code](#5-connect-claude-code)
 6. [Use different workspaces in different projects](#6-use-different-workspaces-in-different-projects)
-7. [Keeping it working](#7-keeping-it-working)
-8. [Uninstall](#8-uninstall)
+7. [Post as a bot persona (webhooks)](#7-post-as-a-bot-persona-webhooks)
+8. [Keeping it working](#8-keeping-it-working)
+9. [Uninstall](#9-uninstall)
 
 ## Before you start
 
@@ -292,7 +297,79 @@ variable, then the nearest `.slacker.json` (for writes, only once it's trusted),
 To move a project to another workspace, run `slacker init <other-workspace> --mcp` there again, then reconnect
 the server in `/mcp`.
 
-## 7. Keeping it working
+## 7. Post as a bot persona (webhooks)
+
+Optional. Sometimes a post should come from a bot ("Deploy Bot 🚀"), not from you. slacker can post through a
+Slack incoming webhook as a **persona**: a webhook URL, a bot name, an icon and an optional default channel.
+
+**Get a webhook URL.** In Slack, create an incoming webhook for the channel you want, either through a Slack
+app (*Incoming Webhooks* feature) or the legacy *Incoming WebHooks* integration if your workspace still allows
+it. It looks like `https://hooks.slack.com/services/T…/B…/…`. Treat it like a password: anyone who has it can
+post.
+
+> A webhook created by a **Slack app** always posts to the channel picked when it was added, with the app's name
+> and icon: Slack ignores the bot name, icon and channel slacker sends. Legacy **Incoming WebHooks** honour all
+> three. If your bot name doesn't show up in Slack, this is why.
+
+**Save a persona.** slacker asks for the URL with hidden input (it never takes it as an argument):
+
+```bash
+slacker webhook add deploy-bot --username "Deploy Bot" --icon rocket --channel deploys
+# Slack webhook URL (input hidden): <paste it, then Enter>
+```
+
+The icon is a Slack emoji name (`rocket` or `:rocket:`) or an image URL. In a script, pipe the URL in instead:
+`printf '%s\n' "$URL" | slacker webhook add deploy-bot …`. The first persona becomes the default.
+
+Check that it worked:
+
+```bash
+slacker webhook list                                    # the URL is shown as …/T…/B…/••••
+slacker webhook send --dry-run "Build 142 is live ✅"   # who would post where; nothing is sent
+slacker webhook send "Build 142 is live ✅"             # posts for real
+```
+
+`webhook list` should show a line like `* deploy-bot  "Deploy Bot" :rocket:  #deploys` (`*` marks the default),
+and the real send prints `✓ Posted as "Deploy Bot" :rocket: (persona "deploy-bot")`. Check the message in Slack.
+
+**One persona per workspace.** If you post to more than one Slack workspace, label each persona with `-w`.
+slacker fills the label in itself when the webhook's team matches one workspace in config.json:
+
+```bash
+slacker -w acme webhook add acme-alerts --username "Acme Alerts" --icon rotating_light
+slacker -w acme webhook send "CPU at 95% on api-3"       # acme's default persona posts
+slacker webhook send -p deploy-bot --channel releases "v2.3 is out"   # or name one
+```
+
+With `-w`, `SLACKER_WORKSPACE` or a trusted `.slacker.json` in play, slacker uses that workspace's default
+persona, and refuses rather than fall back to a persona on another Slack team. Set a workspace's default with
+`slacker webhook default <persona> -w <workspace>`.
+
+**Let Claude Code post as the persona.** If you connected Claude Code in step 5, it already has the
+`send_webhook_message` and `list_webhook_personas` tools: ask *"Dry-run a post as deploy-bot to #releases saying
+v2.3 is out"*. To give Claude a bot that posts **without** any Slack credentials (for example on a machine where
+you skipped step 2), register a webhook-only server in local scope, so the URL never lands in a committed
+`.mcp.json` or in your shell history:
+
+```bash
+read -rs URL    # paste the webhook URL, then Enter (nothing is shown)
+claude mcp add --scope local deploy-bot \
+  -e SLACKER_WEBHOOK_URL="$URL" -e SLACKER_WEBHOOK_USERNAME="Deploy Bot" -e SLACKER_WEBHOOK_ICON=rocket \
+  -- npx -y github:manasnilorout/slacker#<commit> serve --webhook-only
+unset URL
+```
+
+Replace `<commit>` with a commit you've reviewed, so the server doesn't run whatever is on `main` with your
+secret in its environment. If you installed slacker in step 1, you can use `"$(command -v slacker)" serve
+--webhook-only` instead of `npx …`. To post as a persona you saved with `webhook add`, set
+`SLACKER_WEBHOOK_PERSONA=deploy-bot` instead of the URL.
+
+Check it: restart Claude Code, run `/mcp` (`deploy-bot` should be connected), and ask *"List the webhook
+personas"*. Then try a dry run before a real post. As in step 5, Claude Code asks your permission before each
+tool call unless you've allowed it, and Claude is told to post only when you ask and to use a different bot
+name or icon only when you ask for one.
+
+## 8. Keeping it working
 
 | Symptom | Fix |
 | --- | --- |
@@ -301,25 +378,31 @@ the server in `/mcp`.
 | You signed the desktop app in to a new workspace | `slacker auth setup` adds it, then `slacker init <name> --mcp` in its projects. |
 | You switched Node versions and Claude Code can't start slacker | `slacker init <workspace> --mcp --node <stable node path>`, then reconnect in `/mcp`. |
 | `Refusing to write until config.json is fixed` | Two names share a team. See [duplicates](reference.md#fixing-duplicated-workspace-entries). |
-| `Refusing to write: …/.slacker.json picks workspace "x", but it isn't trusted on this machine` | Check the workspace, then `slacker trust` in that project (or pass `-w <name>` for one command). No MCP reconnect needed. See [above](#cloned-a-repo-that-already-has-a-slackerjson). |
+| `Refusing to write: …/.slacker.json picks workspace "x", but it isn't trusted on this machine` | Check the workspace, then `slacker trust` in that project (or pass `-w <name>` for one command). No MCP reconnect needed. See [above](#cloned-a-repo-that-already-has-a-slackerjson). For a webhook post, naming the persona (`-p <persona>`) also works. |
+| Webhook post: `no_persona` | No persona was named and there's no default for this workspace (or the default is on another team). Name one with `-p`, or run `slacker webhook default <persona> [-w <workspace>]`. |
+| Webhook post: `channel_not_found` | The channel doesn't exist, or the webhook was created by a Slack app and can only post to its own channel. Drop `--channel`, or use a legacy Incoming WebHook. |
+| Webhook post: `invalid_token` / `no_service` | The webhook was removed in Slack. Create a new one, then `slacker webhook add <persona>` again (paste the new URL). |
+| Bot name or icon not shown in Slack | The webhook was created by a Slack app, which always uses the app's name and icon. See [step 7](#7-post-as-a-bot-persona-webhooks). |
 
 The MCP server re-reads config.json on every call, so `auth refresh` and `auth setup` take effect without
 restarting it. More in [troubleshooting](reference.md#troubleshooting).
 
-## 8. Uninstall
+## 9. Uninstall
 
 ```bash
 # 1. In each project: remove the pin and the MCP entry
 rm .slacker.json            # and delete the "slacker" entry from .mcp.json
 claude mcp remove slacker   # if you registered it with `claude mcp add` instead
+claude mcp remove deploy-bot  # and any webhook-only servers from step 7
 
 # 2. Remove stored credentials you no longer want, while the command still exists
 slacker auth remove <name>
-rm -r ~/.config/slacker      # the record of projects you trusted (and its lock file)
+rm -r ~/.config/slacker      # projects you trusted and your webhook personas (their URLs), with lock files
 
 # 3. Remove the command
 npm rm -g @manasnilorout/slacker
 ```
 
 The credentials file `~/.config/slack-cli/config.json` is shared with slack-cli, so only delete it if neither
-tool needs it.
+tool needs it. Deleting webhook personas doesn't revoke the webhooks: remove them in Slack too if you no longer
+need them.
